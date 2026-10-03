@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Canteen</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <style>
+    .support-inbox{margin-top:18px;border-top:1px solid #e5e7eb;padding-top:18px}
+    .support-head{display:flex;justify-content:space-between;align-items:center;gap:12px}
+    .support-head h3{margin:0}.support-actions{display:flex;align-items:center;gap:8px}
+    .support-badge{display:inline-flex;min-width:22px;height:22px;padding:0 6px;align-items:center;justify-content:center;border-radius:999px;font-size:12px;font-weight:700;background:#111827;color:#fff}
+    .support-message{border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin-top:10px;background:#fff}
+    .support-message.pending{border-left:4px solid #9ca3af}.support-message.answered{border-left:4px solid #111827}
+    .support-meta{font-size:12px;color:#6b7280;margin-bottom:7px}.support-reply{margin-top:10px;padding:10px 12px;background:#f3f4f6;border-radius:9px}
+    .support-empty{color:#6b7280}.icon{width:16px;height:16px;display:inline-block;vertical-align:-3px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+    button:disabled{cursor:not-allowed;opacity:.55}
+    .disabled-label{display:inline-flex;align-items:center;gap:6px}.disabled-label .icon{width:14px;height:14px}
+  </style>
+</head>
+<body>
+<main class="container">
+  <header class="main-header">
+    <div>
+      <p class="eyebrow">SMART CANTEEN</p>
+      <h1>Kantin Kejujuran</h1>
+      <p>Pilih barang → checkout → bayar dengan QRIS dinamis.</p>
+    </div>
+  </header>
+
+  <section id="products" class="grid"></section>
+
+  <section class="cart card">
+    <h2>Keranjang</h2>
+    <div id="cart"></div>
+    <div class="total">Total: <strong id="total">Rp0</strong></div>
+    <button id="checkoutBtn">Checkout & Generate QRIS</button>
+  </section>
+
+  <section class="support card">
+    <h2>Hubungi Admin</h2>
+    <p>Kalau ada masalah pembayaran, stok, atau transaksi, kirim pesan di sini.</p>
+    <div class="support-grid">
+      <input id="supportContact" placeholder="Kontak (opsional, mis. WhatsApp)">
+      <input id="supportOrderId" placeholder="Transaction ID (opsional)">
+    </div>
+    <textarea id="supportMessage" rows="4" placeholder="Tulis pesan kamu..."></textarea>
+    <button id="sendSupportBtn">Kirim Pesan</button>
+
+    <div class="support-inbox">
+      <div class="support-head">
+        <div>
+          <h3>Pesan Saya</h3>
+          <small>Balasan admin untuk browser ini akan muncul di sini.</small>
+        </div>
+        <div class="support-actions">
+          <span id="supportBadge" class="support-badge" hidden>0</span>
+          <button id="refreshSupportBtn" type="button" title="Perbarui pesan">Refresh</button>
+        </div>
+      </div>
+      <div id="supportInbox"><p class="support-empty">Belum ada pesan.</p></div>
+    </div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
