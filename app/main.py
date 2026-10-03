@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import uuid
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from html import escape
 
@@ -30,7 +31,18 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./smart_canteen.db")
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+LOCAL_DATABASE_PATH = BASE_DIR.parent / "smart_canteen.db"
+
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{LOCAL_DATABASE_PATH.as_posix()}").strip()
+# Neon and other Postgres providers may expose either postgres:// or postgresql://.
+# SQLAlchemy 2.x with psycopg uses the explicit postgresql+psycopg driver.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgres://"):]
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgresql://"):]
+
 MIDTRANS_SERVER_KEY = os.getenv("MIDTRANS_SERVER_KEY", "").strip()
 IS_PRODUCTION = os.getenv("MIDTRANS_IS_PRODUCTION", "false").lower() == "true"
 MIDTRANS_BASE_URL = "https://api.midtrans.com" if IS_PRODUCTION else "https://api.sandbox.midtrans.com"
@@ -50,6 +62,7 @@ ADMIN_SESSION_MINUTES = int(
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+    pool_pre_ping=True,
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
@@ -172,7 +185,12 @@ def seed_products():
 seed_products()
 
 app = FastAPI(title="Smart Canteen API", version="1.0.0")
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/api/health")
+def health_check():
+    return {"ok": True, "service": "smart-canteen"}
 
 
 # =========================
@@ -297,12 +315,12 @@ def finalize_failure(db, tx, status="failed"):
 # =========================
 @app.get("/")
 def index():
-    return FileResponse("app/static/index.html")
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 @app.get("/payment.html")
 def payment_page():
-    return FileResponse("app/static/payment.html")
+    return FileResponse(STATIC_DIR / "payment.html")
 
 @app.get(
     ADMIN_PANEL_PATH,
@@ -581,7 +599,7 @@ def create_support(payload: SupportRequest, request: Request):
         db.commit()
         db.refresh(msg)
         result = JSONResponse({"id": msg.id, "status": msg.status, "message": "Pesan berhasil dikirim ke admin."})
-        result.set_cookie("support_client_id", client_id, max_age=31536000, httponly=True, samesite="lax", secure=False)
+        result.set_cookie("support_client_id", client_id, max_age=31536000, httponly=True, samesite="lax", secure=request.url.scheme == "https")
         return result
     finally:
         db.close()
@@ -621,7 +639,7 @@ def get_support(request: Request):
                 "transaction": tx_info,
             })
         response = JSONResponse(payload)
-        response.set_cookie("support_client_id", client_id, max_age=31536000, httponly=True, samesite="lax", secure=False)
+        response.set_cookie("support_client_id", client_id, max_age=31536000, httponly=True, samesite="lax", secure=request.url.scheme == "https")
         return response
     finally:
         db.close()
@@ -630,7 +648,7 @@ def get_support(request: Request):
 # ADMIN AUTH
 # =========================
 @app.post("/api/admin/login")
-def admin_login(payload: AdminLoginRequest):
+def admin_login(payload: AdminLoginRequest, request: Request):
     if not hmac.compare_digest(payload.username, ADMIN_USERNAME) or not hmac.compare_digest(payload.password, ADMIN_PASSWORD):
         raise HTTPException(status_code=401, detail="Username atau password salah.")
 
@@ -641,7 +659,7 @@ def admin_login(payload: AdminLoginRequest):
         make_admin_token(),
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=request.url.scheme == "https",
         max_age=ADMIN_SESSION_MINUTES * 60
     )
 
