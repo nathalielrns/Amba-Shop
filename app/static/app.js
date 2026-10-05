@@ -1026,8 +1026,11 @@ function renderProducts(){
       `;
 
 
-  box.innerHTML =
-    availableHtml;
+box.innerHTML =
+  availableHtml;
+
+box.classList.remove("products-loading");
+box.removeAttribute("aria-busy");
 
 
   /*
