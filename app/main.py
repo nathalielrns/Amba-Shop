@@ -20,6 +20,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    func,
     ForeignKey,
     Integer,
     String,
@@ -267,6 +268,52 @@ def serialize_tx(db, tx):
             for i in items
         ],
     }
+
+
+def serialize_tx_list(db, transactions):
+    transactions = list(transactions)
+    if not transactions:
+        return []
+
+    tx_ids = [tx.id for tx in transactions]
+    item_rows = (
+        db.query(TransactionItem)
+        .filter(TransactionItem.transaction_id.in_(tx_ids))
+        .order_by(TransactionItem.id.asc())
+        .all()
+    )
+
+    grouped = {}
+    for item in item_rows:
+        grouped.setdefault(item.transaction_id, []).append(item)
+
+    result = []
+    for tx in transactions:
+        items = grouped.get(tx.id, [])
+        result.append({
+            "id": tx.id,
+            "order_id": tx.order_id,
+            "total": tx.total,
+            "payment_status": tx.payment_status,
+            "payment_type": tx.payment_type,
+            "qr_url": tx.qr_url,
+            "midtrans_transaction_id": tx.midtrans_transaction_id,
+            "created_at": tx.created_at.isoformat() if tx.created_at else None,
+            "updated_at": tx.updated_at.isoformat() if tx.updated_at else None,
+            "expires_at": tx.expires_at.isoformat() + "Z" if tx.expires_at else None,
+            "items": [
+                {
+                    "product_id": i.product_id,
+                    "product_name": i.product_name,
+                    "unit_price": i.unit_price,
+                    "discount_percent": i.discount_percent,
+                    "quantity": i.quantity,
+                    "subtotal": i.subtotal,
+                }
+                for i in items
+            ],
+        })
+    return result
 
 
 def release_reservation(db, tx):
@@ -757,9 +804,22 @@ def admin_summary(request: Request):
         low_stock = db.query(Product).filter(Product.is_active.is_(True), (Product.stock - Product.reserved_stock) <= 5).count()
         pending = db.query(Transaction).filter(Transaction.payment_status == "pending").count()
         today_start = datetime.combine(today, datetime.min.time())
-        success_today = db.query(Transaction).filter(Transaction.created_at >= today_start, Transaction.payment_status == "success").all()
+        today_count, today_revenue = db.query(
+            func.count(Transaction.id),
+            func.coalesce(func.sum(Transaction.total), 0),
+        ).filter(
+            Transaction.created_at >= today_start,
+            Transaction.payment_status == "success",
+        ).one()
         messages = db.query(SupportMessage).filter(SupportMessage.status == "open").count()
-        return {"products": products_count, "low_stock": low_stock, "pending_payments": pending, "today_transactions": len(success_today), "today_revenue": sum(t.total for t in success_today), "open_messages": messages}
+        return {
+            "products": products_count,
+            "low_stock": low_stock,
+            "pending_payments": pending,
+            "today_transactions": int(today_count or 0),
+            "today_revenue": int(today_revenue or 0),
+            "open_messages": messages,
+        }
     finally:
         db.close()
 
@@ -895,8 +955,15 @@ def admin_transactions(request: Request, status: str = "all", page: int = 1, pag
         q = db.query(Transaction)
         if status != "all": q = q.filter(Transaction.payment_status == status)
         q = q.order_by(Transaction.created_at.desc())
-        total = q.count(); rows = q.offset((page-1)*page_size).limit(page_size).all()
-        return {"items": [serialize_tx(db, tx) for tx in rows], "page": page, "page_size": page_size, "total": total, "has_next": page*page_size < total}
+        total = q.count()
+        rows = q.offset((page-1)*page_size).limit(page_size).all()
+        return {
+            "items": serialize_tx_list(db, rows),
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "has_next": page * page_size < total,
+        }
     finally:
         db.close()
 
@@ -970,7 +1037,10 @@ def admin_database(request: Request, table: str = "products", page: int = 1, pag
         if table == "products":
             q=db.query(Product).order_by(Product.id.asc()); total=q.count(); rows=[product_dict(x) for x in q.offset((page-1)*page_size).limit(page_size).all()]
         elif table == "transactions":
-            q=db.query(Transaction).order_by(Transaction.created_at.desc()); total=q.count(); rows=[serialize_tx(db,x) for x in q.offset((page-1)*page_size).limit(page_size).all()]
+            q=db.query(Transaction).order_by(Transaction.created_at.desc())
+            total=q.count()
+            tx_rows=q.offset((page-1)*page_size).limit(page_size).all()
+            rows=serialize_tx_list(db, tx_rows)
         elif table == "stock_movements":
             q=db.query(StockMovement).order_by(StockMovement.created_at.desc()); total=q.count(); rows=[{"id":r.id,"product_id":r.product_id,"change_qty":r.change_qty,"reason":r.reason,"created_at":r.created_at.isoformat() if r.created_at else None} for r in q.offset((page-1)*page_size).limit(page_size).all()]
         elif table == "support_messages":
@@ -986,6 +1056,7 @@ ADMIN_HTML = r'''<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Admin - Smart Canteen</title>
+<link rel="icon" type="image/png" href="/static/pict/logo.png">
 <link rel="stylesheet" href="/static/style.css">
 <style>
 .ui-icon{width:16px;height:16px;display:inline-block;vertical-align:-3px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;margin-right:6px}
@@ -1058,9 +1129,9 @@ async function deleteProduct(id){
         uiAlert(e.message);
     }
 }
-document.querySelector('#productForm').addEventListener('submit',async e=>{e.preventDefault();const btn=e.target.querySelector('button');const payload={name:document.querySelector('#pName').value.trim(),price:Number(document.querySelector('#pPrice').value),discount_percent:Number(document.querySelector('#pDiscount').value),stock:Number(document.querySelector('#pStock').value)};if(!payload.name||!Number.isInteger(payload.price)||payload.price<=0||!Number.isFinite(payload.discount_percent)||payload.discount_percent<0||payload.discount_percent>100||!Number.isInteger(payload.stock)||payload.stock<0)return uiAlert('Data produk belum valid.');btn.disabled=true;try{await api('/api/admin/products',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});e.target.reset();document.querySelector('#pDiscount').value=0;document.querySelector('#pStock').value=0;pageState.products=1;await loadProducts(1);await loadSummary()}catch(x){uiAlert(x.message)}finally{btn.disabled=false}});
+document.querySelector('#productForm').addEventListener('submit',async e=>{e.preventDefault();const btn=e.target.querySelector('button');const payload={name:document.querySelector('#pName').value.trim(),price:Number(document.querySelector('#pPrice').value),discount_percent:Number(document.querySelector('#pDiscount').value),stock:Number(document.querySelector('#pStock').value)};if(!payload.name||!Number.isInteger(payload.price)||payload.price<=0||!Number.isFinite(payload.discount_percent)||payload.discount_percent<0||payload.discount_percent>100||!Number.isInteger(payload.stock)||payload.stock<0)return uiAlert('Data produk belum valid.');btn.disabled=true;try{await api('/api/admin/products',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});e.target.reset();document.querySelector('#pDiscount').value=0;document.querySelector('#pStock').value=0;pageState.products=1;await Promise.all([loadProducts(1),loadSummary()])}catch(x){uiAlert(x.message)}finally{btn.disabled=false}});
 async function loadTransactions(page=pageState.transactions){pageState.transactions=Math.max(1,page);const st=document.querySelector('#txFilter').value;const d=await api('/api/admin/transactions?status='+encodeURIComponent(st)+'&page='+pageState.transactions+'&page_size='+PAGE_SIZE);const rows=d.items||[];document.querySelector('#transactionsTable').innerHTML=rows.length?`<table><thead><tr><th>Order</th><th>Items</th><th>Total</th><th>Status</th><th>Waktu</th><th>Aksi</th></tr></thead><tbody>${rows.map(t=>`<tr><td><code>${esc(t.order_id)}</code></td><td>${t.items.map(i=>`${esc(i.product_name)} × ${i.quantity}`).join('<br>')}</td><td>${rupiah(t.total)}</td><td><span class="status-${t.payment_status}">${esc(t.payment_status)}</span></td><td>${new Date(t.created_at).toLocaleString('id-ID')}</td><td>${t.payment_status==='pending'?`<button onclick="verifyTx('${t.order_id}','success')">Bayar</button> <button class="danger" onclick="verifyTx('${t.order_id}','failed')">Tolak</button>`:'—'}</td></tr>`).join('')}</tbody></table>`:'<p>Belum ada transaksi.</p>';pager('transactionsPager',d.page,d.total,d.has_next,'loadTransactions')}
-async function verifyTx(id,status){if(!(await uiConfirm(status==='success'?'Tandai pembayaran sebagai BERHASIL?':'Tolak pembayaran ini?','Verifikasi pembayaran')))return;try{await api('/api/admin/transactions/'+encodeURIComponent(id)+'/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})});await loadTransactions(pageState.transactions);await loadProducts(pageState.products);await loadSummary()}catch(e){uiAlert(e.message)}}document.querySelector('#txFilter').onchange=()=>loadTransactions(1);
+async function verifyTx(id,status){if(!(await uiConfirm(status==='success'?'Tandai pembayaran sebagai BERHASIL?':'Tolak pembayaran ini?','Verifikasi pembayaran')))return;try{await api('/api/admin/transactions/'+encodeURIComponent(id)+'/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})});await Promise.all([loadTransactions(pageState.transactions),loadProducts(pageState.products),loadSummary()])}catch(e){uiAlert(e.message)}}document.querySelector('#txFilter').onchange=()=>loadTransactions(1);
 async function loadSupport(page=pageState.support){pageState.support=Math.max(1,page);const d=await api('/api/admin/support?page='+pageState.support+'&page_size='+PAGE_SIZE);const rows=d.items||[];document.querySelector('#supportTable').innerHTML=rows.length?`<table><thead><tr><th>Waktu</th><th>Kontak</th><th>Order</th><th>Pesan</th><th>Status</th><th>Balasan</th><th>Aksi</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${new Date(r.created_at).toLocaleString('id-ID')}</td><td>${esc(r.contact||'—')}</td><td>${esc(r.order_id||'—')}</td><td>${esc(r.message)}</td><td>${esc(r.status)}</td><td>${esc(r.admin_reply||'—')}</td><td>${r.status==='open'?`<button onclick="replySupport(${r.id})">Balas</button>`:'—'}</td></tr>`).join('')}</tbody></table>`:'<p>Belum ada pesan.</p>';pager('supportPager',d.page,d.total,d.has_next,'loadSupport')}
 async function replySupport(id){const reply=await uiPrompt('Balasan admin:','','Balas pesan user');if(reply===null)return;try{await api('/api/admin/support/'+id+'/reply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reply})});await loadSupport(pageState.support);await loadSummary()}catch(e){uiAlert(e.message)}}
 const dbConfigs={products:{title:'Products',cols:[['ID','id'],['Nama','name'],['Harga',r=>rupiah(r.price)],['Diskon',r=>esc(r.discount_percent)+'%'],['Harga Jual',r=>rupiah(r.effective_price)],['Stok Tersedia','available_stock'],['Stok Fisik','stock'],['Dipesan','reserved_stock'],['Status',r=>r.is_active?'Aktif':'Nonaktif']]},transactions:{title:'Transactions',cols:[['Order','order_id'],['Total',r=>rupiah(r.total)],['Status','payment_status'],['Metode','payment_type'],['Dibuat',r=>r.created_at?new Date(r.created_at).toLocaleString('id-ID'):'-'],['Kedaluwarsa',r=>r.expires_at?new Date(r.expires_at).toLocaleString('id-ID'):'-']]},stock_movements:{title:'Stock Movements',cols:[['ID','id'],['Produk ID','product_id'],['Perubahan',r=>(r.change_qty>0?'+':'')+r.change_qty],['Alasan','reason'],['Waktu',r=>r.created_at?new Date(r.created_at).toLocaleString('id-ID'):'-']]},support_messages:{title:'Support Messages',cols:[['ID','id'],['Client ID','client_id'],['Order','order_id'],['Kontak','contact'],['Pesan','message'],['Status','status'],['Balasan Admin','admin_reply'],['Waktu',r=>r.created_at?new Date(r.created_at).toLocaleString('id-ID'):'-']]}};

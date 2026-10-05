@@ -49,6 +49,14 @@ const icons = {
       <path d="m7 7 10 10M17 7 7 17"/>
     </svg>
   `,
+  trash: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 7h16"/>
+      <path d="M9 7V4h6v3"/>
+      <path d="M7 7l1 13h8l1-13"/>
+      <path d="M10 11v5M14 11v5"/>
+    </svg>
+  `,
 
   back: `
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -593,6 +601,86 @@ function injectSupportStyles() {
 
     .sold-out-card button{
       cursor:not-allowed;
+    }
+    .sold-out-section{
+      display:flex;
+      flex-direction:column;
+      align-items:center;
+      width:100%;
+      margin-top:28px;
+      padding-top:6px;
+      clear:both;
+    }
+
+    .sold-out-toggle{
+      min-height:44px;
+      margin:0 auto;
+      padding:10px 16px;
+    }
+
+    .sold-out-content{
+      width:100%;
+      margin-top:18px;
+    }
+
+    .sold-out-content .grid{
+      width:100%;
+    }
+
+    .cart-controls{
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      gap:8px;
+      min-width:0;
+    }
+
+    .cart-controls .delete-btn{
+      width:38px;
+      height:38px;
+      min-width:38px;
+      padding:0;
+      margin-left:4px;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      border:1px solid #e7b8bd;
+      border-radius:10px;
+      background:#fff3f4;
+      color:#b51d2b;
+      line-height:0;
+    }
+
+    .cart-controls .delete-btn svg{
+      width:17px;
+      height:17px;
+      display:block;
+      fill:none;
+      stroke:currentColor;
+      stroke-width:1.8;
+      stroke-linecap:round;
+      stroke-linejoin:round;
+    }
+
+    .cart-controls .delete-btn:hover{
+      background:#fde5e7;
+      color:#9f1724;
+    }
+
+    @media(max-width:600px){
+      .sold-out-section{
+        margin-top:24px;
+      }
+
+      .cart-controls{
+        gap:6px;
+      }
+
+      .cart-controls .delete-btn{
+        width:36px;
+        height:36px;
+        min-width:36px;
+      }
     }
 
 
@@ -1493,7 +1581,7 @@ function renderProducts(){
 
         `
 
-          <div class="sold-out-section">
+          <div class="sold-out-content">
 
             <h3 class="sold-out-title">
               Produk Habis
@@ -1708,9 +1796,10 @@ function renderCart(){
                 <button
                   class="delete-btn"
                   title="Hapus dari keranjang"
+                  aria-label="Hapus ${esc(p.name)} dari keranjang"
                   onclick="removeFromCart(${p.id})"
                 >
-                  ${icons.close}
+                  ${icons.trash}
                 </button>
 
               </div>
