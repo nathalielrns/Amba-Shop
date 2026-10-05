@@ -3,6 +3,7 @@ const ACTIVE_ORDER_KEY = "smart_canteen_active_order";
 const SUPPORT_CACHE_KEY = "smart_canteen_support_cache";
 const SUPPORT_SEEN_KEY = "smart_canteen_support_seen_replies";
 const TRANSACTION_HISTORY_KEY = "smart_canteen_transaction_history";
+const TRANSACTION_SEEN_KEY = "smart_canteen_transaction_seen";
 
 let products = [];
 let soldOutProducts = [];
@@ -99,12 +100,14 @@ function uiPrompt(message,defaultValue="",title="Isi data"){injectDialogUI();ret
    TRANSACTION NOTIFICATIONS / HISTORY
 ========================================================= */
 function readTransactionHistory(){try{const rows=JSON.parse(localStorage.getItem(TRANSACTION_HISTORY_KEY)||"[]");return Array.isArray(rows)?rows:[];}catch{return[];}}
-function saveTransactionHistory(tx){if(!tx?.order_id)return;const rows=readTransactionHistory().filter(x=>x.order_id!==tx.order_id);rows.unshift({order_id:tx.order_id,total:tx.total,payment_status:tx.payment_status,payment_type:tx.payment_type||null,created_at:tx.created_at||new Date().toISOString(),updated_at:tx.updated_at||new Date().toISOString(),items:Array.isArray(tx.items)?tx.items:[]});localStorage.setItem(TRANSACTION_HISTORY_KEY,JSON.stringify(rows.slice(0,30)));renderTransactionHistory();updateTransactionBadge();}
+function getSeenTransactions(){try{const rows=JSON.parse(localStorage.getItem(TRANSACTION_SEEN_KEY)||"[]");return new Set(Array.isArray(rows)?rows.map(String):[]);}catch{return new Set();}}
+function markTransactionSeen(orderId){const seen=getSeenTransactions();seen.add(String(orderId));localStorage.setItem(TRANSACTION_SEEN_KEY,JSON.stringify([...seen].slice(-100)));updateTransactionBadge();renderTransactionHistory();}
+function saveTransactionHistory(tx){if(!tx?.order_id)return;const existing=readTransactionHistory().find(x=>x.order_id===tx.order_id);const rows=readTransactionHistory().filter(x=>x.order_id!==tx.order_id);rows.unshift({order_id:tx.order_id,total:tx.total,payment_status:tx.payment_status,payment_type:tx.payment_type||null,created_at:tx.created_at||existing?.created_at||new Date().toISOString(),updated_at:tx.updated_at||new Date().toISOString(),items:Array.isArray(tx.items)?tx.items:(existing?.items||[])});localStorage.setItem(TRANSACTION_HISTORY_KEY,JSON.stringify(rows.slice(0,30)));renderTransactionHistory();updateTransactionBadge();}
 function transactionStatusLabel(status){return({success:"Berhasil",pending:"Menunggu pembayaran",cancelled:"Dibatalkan",expired:"Kedaluwarsa",failed:"Gagal"}[status]||status||"Tidak diketahui");}
 function transactionStatusClass(status){return`tx-${status||"unknown"}`;}
-function renderTransactionHistory(){const body=document.querySelector("#transactionPanelBody");if(!body)return;const rows=readTransactionHistory();if(!rows.length){body.innerHTML=`<div class="transaction-empty">Belum ada riwayat transaksi di perangkat ini.</div>`;return;}body.innerHTML=rows.map(tx=>`<button class="transaction-list-item" type="button" onclick="openTransactionDetail('${esc(tx.order_id)}')"><span class="transaction-list-icon">${icons.bell}</span><span class="transaction-list-copy"><span class="transaction-list-title">${esc(tx.items?.[0]?.product_name||"Transaksi")}${tx.items?.length>1?` + ${tx.items.length-1} lainnya`:""}</span><span class="transaction-list-meta">${rupiah(tx.total)} · ${transactionStatusLabel(tx.payment_status)} · ${tx.created_at?new Date(tx.created_at).toLocaleDateString("id-ID"):"-"}</span></span><span class="transaction-list-status ${transactionStatusClass(tx.payment_status)}">${esc(transactionStatusLabel(tx.payment_status))}</span></button>`).join("");}
-function updateTransactionBadge(){const badge=document.querySelector("#transactionFabBadge");if(!badge)return;const rows=readTransactionHistory();const hasPending=rows.some(x=>x.payment_status==="pending");badge.textContent=rows.length>99?"99+":rows.length;badge.hidden=!rows.length;badge.classList.toggle("pending",hasPending);}
-function openTransactionDetail(orderId){const tx=readTransactionHistory().find(x=>x.order_id===orderId);if(!tx)return;const body=document.querySelector("#transactionPanelBody");if(!body)return;body.innerHTML=`<div class="transaction-detail"><button class="transaction-detail-back" type="button" onclick="renderTransactionHistory()">${icons.back} Kembali</button><h3>${esc(tx.order_id)}</h3><p class="transaction-detail-date">${tx.created_at?new Date(tx.created_at).toLocaleString("id-ID"):"-"}</p><div class="transaction-detail-status ${transactionStatusClass(tx.payment_status)}">${esc(transactionStatusLabel(tx.payment_status))}</div><div class="transaction-detail-total"><span>Total</span><strong>${rupiah(tx.total)}</strong></div><div class="transaction-detail-items">${(tx.items||[]).map(i=>`<div><span>${esc(i.product_name)} × ${i.quantity}</span><strong>${rupiah(i.subtotal)}</strong></div>`).join("")||"Tidak ada detail item."}</div></div>`;}
+function renderTransactionHistory(){const body=document.querySelector("#transactionPanelBody");if(!body)return;const rows=readTransactionHistory();if(!rows.length){body.innerHTML=`<div class="transaction-empty">Belum ada riwayat transaksi di perangkat ini.</div>`;return;}const seen=getSeenTransactions();body.innerHTML=rows.map(tx=>{const unread=!seen.has(String(tx.order_id));return `<button class="transaction-list-item ${unread?"unread":"read"}" type="button" onclick="openTransactionDetail('${esc(tx.order_id)}')"><span class="transaction-list-icon">${icons.bell}</span><span class="transaction-list-copy"><span class="transaction-list-title">${esc(tx.items?.[0]?.product_name||"Transaksi")}${tx.items?.length>1?` + ${tx.items.length-1} lainnya`:""}</span><span class="transaction-list-meta">${rupiah(tx.total)} · ${transactionStatusLabel(tx.payment_status)} · ${tx.created_at?new Date(tx.created_at).toLocaleDateString("id-ID"):"-"}</span><span class="transaction-list-unread" ${unread?"":"hidden"}>Belum dibaca</span></span><span class="transaction-list-status ${transactionStatusClass(tx.payment_status)}">${esc(transactionStatusLabel(tx.payment_status))}</span></button>`;}).join("");}
+function updateTransactionBadge(){const badge=document.querySelector("#transactionFabBadge");if(!badge)return;const seen=getSeenTransactions();const unread=readTransactionHistory().filter(x=>!seen.has(String(x.order_id))).length;badge.textContent=unread>99?"99+":unread;badge.hidden=unread===0;}
+function openTransactionDetail(orderId){markTransactionSeen(orderId);const tx=readTransactionHistory().find(x=>x.order_id===orderId);if(!tx)return;const body=document.querySelector("#transactionPanelBody");if(!body)return;body.innerHTML=`<div class="transaction-detail"><button class="transaction-detail-back" type="button" onclick="renderTransactionHistory()">${icons.back} Kembali</button><h3>${esc(tx.order_id)}</h3><p class="transaction-detail-date">${tx.created_at?new Date(tx.created_at).toLocaleString("id-ID"):"-"}</p><div class="transaction-detail-status ${transactionStatusClass(tx.payment_status)}">${esc(transactionStatusLabel(tx.payment_status))}</div><div class="transaction-detail-total"><span>Total</span><strong>${rupiah(tx.total)}</strong></div><div class="transaction-detail-items">${(tx.items||[]).map(i=>`<div><span>${esc(i.product_name)} × ${i.quantity}</span><strong>${rupiah(i.subtotal)}</strong></div>`).join("")||"Tidak ada detail item."}</div></div>`;}
 async function syncTransactionHistory(){
   try{
     const res=await fetch("/api/transactions/history?limit=30",{cache:"no-store"});
@@ -114,7 +117,7 @@ async function syncTransactionHistory(){
     rows.slice().reverse().forEach(saveTransactionHistory);
   }catch(e){console.debug("Riwayat server belum tersedia:",e);}
 }
-function setupTransactionUI(){if(document.querySelector("#transactionFab"))return;document.body.insertAdjacentHTML("beforeend",`<button id="transactionFab" class="transaction-fab" type="button" title="Riwayat transaksi" aria-label="Riwayat transaksi">${icons.bell}<span id="transactionFabBadge" class="transaction-fab-badge" hidden>0</span></button><aside id="transactionPanel" class="transaction-panel" hidden><div class="transaction-panel-head"><div><h3>Riwayat Transaksi</h3><small>Transaksi dari perangkat ini</small></div><button id="transactionPanelClose" class="transaction-panel-close" type="button">${icons.close}</button></div><div id="transactionPanelBody" class="transaction-panel-body"></div></aside>`);document.querySelector("#transactionFab").addEventListener("click",()=>{const panel=document.querySelector("#transactionPanel");panel.hidden=!panel.hidden;if(!panel.hidden)renderTransactionHistory();});document.querySelector("#transactionPanelClose").addEventListener("click",()=>document.querySelector("#transactionPanel").hidden=true);renderTransactionHistory();updateTransactionBadge();}
+function setupTransactionUI(){if(document.querySelector("#transactionFab"))return;document.body.insertAdjacentHTML("beforeend",`<button id="transactionFab" class="transaction-fab" type="button" title="Riwayat transaksi" aria-label="Riwayat transaksi">${icons.bell}<span id="transactionFabBadge" class="transaction-fab-badge" hidden>0</span></button><aside id="transactionPanel" class="transaction-panel" hidden><div class="transaction-panel-head"><div><h3>Riwayat Transaksi</h3><small>Transaksi dari perangkat ini</small></div><button id="transactionPanelClose" class="transaction-panel-close" type="button" aria-label="Tutup">${icons.close}</button></div><div id="transactionPanelBody" class="transaction-panel-body"></div></aside>`);document.querySelector("#transactionFab").addEventListener("click",e=>{e.stopPropagation();const panel=document.querySelector("#transactionPanel");panel.hidden=!panel.hidden;if(!panel.hidden)renderTransactionHistory();});document.querySelector("#transactionPanelClose").addEventListener("click",()=>document.querySelector("#transactionPanel").hidden=true);renderTransactionHistory();updateTransactionBadge();}
 
 /* =========================================================
    SUPPORT FLOATING UI
@@ -133,7 +136,7 @@ function injectSupportStyles() {
   style.textContent = `
 
     .app-dialog[hidden],.transaction-panel[hidden]{display:none}.app-dialog{position:fixed;inset:0;z-index:3000;display:grid;place-items:center;padding:18px}.app-dialog-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.38);backdrop-filter:blur(2px)}.app-dialog-card{position:relative;width:min(420px,100%);background:#fff;border:1px solid #e2e4e8;border-radius:18px;padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.22)}.app-dialog-card h3{margin:0 0 8px}.app-dialog-card p{margin:0;white-space:pre-line;color:#4b5563;line-height:1.5}.app-dialog-input{width:100%;box-sizing:border-box;margin-top:14px;padding:11px 12px;border:1px solid #d5d8dd;border-radius:10px;font:inherit}.app-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.app-dialog-actions button{min-width:84px}.app-dialog-secondary{background:#f1f2f4!important;color:#20242b!important}
-    .transaction-fab{position:fixed;right:22px;bottom:92px;width:52px;height:52px;border:0;border-radius:50%;display:grid;place-items:center;background:#fff;color:#111318;box-shadow:0 10px 30px rgba(0,0,0,.18);cursor:pointer;z-index:1000;border:1px solid #e2e4e8}.transaction-fab svg{width:23px;height:23px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.transaction-fab-badge{position:absolute;right:-3px;top:-3px;min-width:19px;height:19px;padding:0 5px;border-radius:10px;background:#111318;color:#fff;font-size:10px;font-weight:700;display:grid;place-items:center;border:2px solid #fff}.transaction-fab-badge.pending{background:#b51d2b}.transaction-fab-badge[hidden]{display:none}.transaction-panel{position:fixed;right:22px;bottom:154px;width:min(430px,calc(100vw - 30px));max-height:min(620px,calc(100vh - 180px));background:#fff;border:1px solid #e2e4e8;border-radius:18px;box-shadow:0 18px 50px rgba(0,0,0,.18);z-index:999;overflow:hidden}.transaction-panel[hidden]{display:none}.transaction-panel-head{display:flex;align-items:center;justify-content:space-between;padding:15px 17px;border-bottom:1px solid #eceef1}.transaction-panel-head h3{margin:0;font-size:1rem}.transaction-panel-head small{display:block;margin-top:3px;color:#747982}.transaction-panel-close{width:34px;height:34px;border:0;border-radius:10px;background:#f1f2f4;display:grid;place-items:center}.transaction-panel-close svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}.transaction-panel-body{max-height:520px;overflow:auto;padding:8px}.transaction-list-item{width:100%;display:flex;align-items:center;gap:10px;padding:13px 10px;border:0;border-bottom:1px solid #f0f1f3;background:#fff;text-align:left;cursor:pointer}.transaction-list-item:hover{background:#f8f9fa}.transaction-list-icon{width:34px;height:34px;display:grid;place-items:center;border-radius:10px;background:#f1f2f4;flex:none}.transaction-list-icon svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8}.transaction-list-copy{min-width:0;display:flex;flex-direction:column;gap:3px;flex:1}.transaction-list-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.transaction-list-meta{font-size:.78rem;color:#747982}.transaction-list-status{font-size:.72rem;font-weight:700;white-space:nowrap}.tx-success{color:#2f8f4e}.tx-pending{color:#9a6a18}.tx-cancelled,.tx-failed{color:#777}.tx-expired{color:#9a6a18}.transaction-empty{text-align:center;color:#747982;padding:34px 18px}.transaction-detail{padding:8px}.transaction-detail-back{border:0;background:none;padding:6px 0;display:inline-flex;align-items:center;gap:4px}.transaction-detail-back svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.8}.transaction-detail h3{margin:15px 0 4px;font-size:.98rem;word-break:break-all}.transaction-detail-date{font-size:.78rem;color:#747982}.transaction-detail-status{margin:14px 0;padding:10px 12px;border-radius:10px;background:#f4f5f7}.transaction-detail-total{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #eceef1}.transaction-detail-items{padding-top:10px}.transaction-detail-items>div{display:flex;justify-content:space-between;gap:12px;padding:7px 0;font-size:.86rem}
+    .transaction-fab{position:fixed;right:22px;bottom:92px;width:52px;height:52px;border:0;border-radius:50%;display:grid;place-items:center;background:#fff;color:#111318;box-shadow:0 10px 30px rgba(0,0,0,.18);cursor:pointer;z-index:1000;border:1px solid #e2e4e8}.transaction-fab svg{width:23px;height:23px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.transaction-fab-badge{position:absolute;right:-3px;top:-3px;min-width:19px;height:19px;padding:0 5px;border-radius:10px;background:#111318;color:#fff;font-size:10px;font-weight:700;display:grid;place-items:center;border:2px solid #fff}.transaction-fab-badge.pending{background:#b51d2b}.transaction-fab-badge[hidden]{display:none}.transaction-panel{position:fixed;right:22px;bottom:154px;width:min(430px,calc(100vw - 30px));max-height:min(620px,calc(100vh - 180px));background:#fff;border:1px solid #e2e4e8;border-radius:18px;box-shadow:0 18px 50px rgba(0,0,0,.18);z-index:999;overflow:hidden}.transaction-panel[hidden]{display:none}.transaction-panel-head{display:flex;align-items:center;justify-content:space-between;padding:15px 17px;border-bottom:1px solid #eceef1}.transaction-panel-head h3{margin:0;font-size:1rem}.transaction-panel-head small{display:block;margin-top:3px;color:#747982}.transaction-panel-close{width:40px;height:40px;border:1px solid #e3e5e8;border-radius:50%;background:#f7f8fa;color:#6f747c;display:grid;place-items:center;cursor:pointer;transition:.15s}.transaction-panel-close:hover{background:#eceef1;color:#111318}.transaction-panel-close svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.transaction-panel-close svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}.transaction-panel-body{max-height:520px;overflow:auto;padding:8px}.transaction-list-item{width:100%;display:flex;align-items:center;gap:10px;padding:13px 10px;border:0;border-bottom:1px solid #f0f1f3;background:#fff;text-align:left;cursor:pointer}.transaction-list-item:hover{background:#f8f9fa}.transaction-list-item.unread{background:#f7f8fa}.transaction-list-item.unread .transaction-list-title{font-weight:800;color:#111318}.transaction-list-item.unread .transaction-list-icon{background:#eceef1}.transaction-list-unread{display:inline-block;margin-top:3px;font-size:.68rem;font-weight:800;color:#b51d2b}.transaction-list-unread[hidden]{display:none}.transaction-list-icon{width:34px;height:34px;display:grid;place-items:center;border-radius:10px;background:#f1f2f4;flex:none}.transaction-list-icon svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8}.transaction-list-copy{min-width:0;display:flex;flex-direction:column;gap:3px;flex:1}.transaction-list-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.transaction-list-meta{font-size:.78rem;color:#747982}.transaction-list-status{font-size:.72rem;font-weight:700;white-space:nowrap}.tx-success{color:#2f8f4e}.tx-pending{color:#9a6a18}.tx-cancelled,.tx-failed{color:#777}.tx-expired{color:#9a6a18}.transaction-empty{text-align:center;color:#747982;padding:34px 18px}.transaction-detail{padding:8px}.transaction-detail-back{border:0;background:none;padding:6px 0;display:inline-flex;align-items:center;gap:4px}.transaction-detail-back svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.8}.transaction-detail h3{margin:15px 0 4px;font-size:.98rem;word-break:break-all}.transaction-detail-date{font-size:.78rem;color:#747982}.transaction-detail-status{margin:14px 0;padding:10px 12px;border-radius:10px;background:#f4f5f7}.transaction-detail-total{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #eceef1}.transaction-detail-items{padding-top:10px}.transaction-detail-items>div{display:flex;justify-content:space-between;gap:12px;padding:7px 0;font-size:.86rem}
 
     .sold-out-toggle{
       margin:18px auto 0;
@@ -304,13 +307,15 @@ function injectSupportStyles() {
     }
 
     .support-panel-close{
-      width:34px;
+      width:40px;
       height:34px;
 
       border:0;
-      border-radius:10px;
+      border-radius:50%;
 
-      background:#f1f2f4;
+      background:#f7f8fa;
+      border:1px solid #e3e5e8;
+      color:#6f747c;
 
       display:grid;
       place-items:center;
@@ -318,8 +323,8 @@ function injectSupportStyles() {
       cursor:pointer;
     }
 
-    .support-panel-close svg{
-      width:18px;
+    .support-panel-close:hover{background:#eceef1;color:#111318}.support-panel-close svg{
+      width:17px;
       height:18px;
 
       fill:none;
@@ -363,6 +368,8 @@ function injectSupportStyles() {
     .support-list-item:hover{
       background:#f7f7f8;
     }
+
+    .support-list-item.unread{background:#f7f8fa}.support-list-item.unread .support-list-title{font-weight:800;color:#111318}.support-list-item.unread .support-list-icon{background:#eceef1}.support-list-item.unread .support-list-meta{color:#4b5563;font-weight:600}
 
     .support-list-icon{
       width:34px;
@@ -711,6 +718,20 @@ function setupSupportUI(){
 
       }
     );
+
+  document.addEventListener("pointerdown",event=>{
+    const panel=document.querySelector("#supportPanel");
+    const fab=document.querySelector("#supportFab");
+    if(panel && !panel.hidden && !panel.contains(event.target) && !fab.contains(event.target)) panel.hidden=true;
+    const txPanel=document.querySelector("#transactionPanel");
+    const txFab=document.querySelector("#transactionFab");
+    if(txPanel && !txPanel.hidden && !txPanel.contains(event.target) && !txFab.contains(event.target)) txPanel.hidden=true;
+  });
+  document.addEventListener("keydown",event=>{
+    if(event.key!=="Escape")return;
+    document.querySelector("#supportPanel")?.setAttribute("hidden","");
+    document.querySelector("#transactionPanel")?.setAttribute("hidden","");
+  });
 
 }
 
@@ -1353,7 +1374,7 @@ async function checkout(){
   btn.disabled = true;
 
   btn.textContent =
-    "Membuat transaksi...";
+    "Membuka pembayaran...";
 
 
   try{
@@ -1533,6 +1554,7 @@ function markReplySeen(id){
   );
 
 
+  renderSupportList();
   updateSupportBadge();
 
 }
@@ -1629,7 +1651,7 @@ function renderSupportList(){
         m => `
 
           <button
-            class="support-list-item"
+            class="support-list-item ${m.admin_reply && !getSeenReplies().has(Number(m.id)) ? "unread" : "read"}"
             type="button"
             onclick="openSupportDetail(${m.id})"
           >
@@ -1662,7 +1684,7 @@ function renderSupportList(){
 
                 ${
                   m.admin_reply
-                    ? "Sudah dibalas admin"
+                    ? (getSeenReplies().has(Number(m.id)) ? "Sudah dibaca · Sudah dibalas admin" : "Belum dibaca · Sudah dibalas admin")
                     : "Menunggu balasan"
                 }
 
@@ -2287,5 +2309,9 @@ supportPollTimer =
   setInterval(
     () =>
       loadSupportMessages(false),
-    15000
+    2000
   );
+
+document.addEventListener("visibilitychange",()=>{
+  if(!document.hidden) loadSupportMessages(false);
+});

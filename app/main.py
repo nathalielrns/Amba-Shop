@@ -454,24 +454,67 @@ async def checkout(payload: CheckoutRequest, request: Request):
         db.commit()
         db.refresh(tx)
 
-        if not MIDTRANS_SERVER_KEY:
-            return {"order_id": order_id, "total": total, "payment_status": "pending", "qr_url": None, "midtrans_transaction_id": None, "mode": "local", "expires_at": expires_at.isoformat() + "Z", "payment_duration_minutes": PAYMENT_DURATION_MINUTES}
+        # QRIS generation is prepared by the payment page after the transaction
+        # has already been created. This keeps checkout/navigation fast.
+        return {"order_id": order_id, "total": total, "payment_status": tx.payment_status, "qr_url": None, "midtrans_transaction_id": None, "mode": "midtrans" if MIDTRANS_SERVER_KEY else "local", "expires_at": expires_at.isoformat() + "Z", "payment_duration_minutes": PAYMENT_DURATION_MINUTES}
+    finally:
+        db.close()
 
-        item_details = [{"id": str(p.id), "price": effective, "quantity": quantity, "name": p.name} for p, quantity, effective in products]
-        body = {"payment_type": "qris", "transaction_details": {"order_id": order_id, "gross_amount": total}, "item_details": item_details, "qris": {"acquirer": "gopay"}}
+
+# =========================
+# PREPARE QRIS PAYMENT
+# =========================
+@app.post("/api/transactions/{order_id}/prepare-payment")
+async def prepare_payment(order_id: str):
+    db = SessionLocal()
+    try:
+        tx = db.query(Transaction).filter(Transaction.order_id == order_id).first()
+        if not tx:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+
+        if tx.payment_status != "pending":
+            return serialize_tx(db, tx)
+
+        if tx.expires_at and utc_now() >= tx.expires_at:
+            finalize_failure(db, tx, "expired")
+            db.commit()
+            return serialize_tx(db, tx)
+
+        if tx.qr_url or tx.midtrans_transaction_id:
+            return serialize_tx(db, tx)
+
+        if not MIDTRANS_SERVER_KEY:
+            return {**serialize_tx(db, tx), "mode": "local"}
+
+        items = db.query(TransactionItem).filter(TransactionItem.transaction_id == tx.id).all()
+        item_details = [
+            {
+                "id": str(i.product_id),
+                "price": i.unit_price,
+                "quantity": i.quantity,
+                "name": i.product_name,
+            }
+            for i in items
+        ]
+        body = {
+            "payment_type": "qris",
+            "transaction_details": {"order_id": tx.order_id, "gross_amount": tx.total},
+            "item_details": item_details,
+            "qris": {"acquirer": "gopay"},
+        }
 
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                response = await client.post(f"{MIDTRANS_BASE_URL}/v2/charge", headers=midtrans_auth_headers(), json=body)
+            async with httpx.AsyncClient(timeout=8) as client:
+                response = await client.post(
+                    f"{MIDTRANS_BASE_URL}/v2/charge",
+                    headers=midtrans_auth_headers(),
+                    json=body,
+                )
             data = response.json()
         except Exception as exc:
-            finalize_failure(db, tx, "failed")
-            db.commit()
             raise HTTPException(status_code=502, detail=f"Midtrans request failed: {exc}")
 
         if response.status_code >= 400:
-            finalize_failure(db, tx, "failed")
-            db.commit()
             raise HTTPException(status_code=502, detail=data)
 
         qr_url = None
@@ -484,9 +527,11 @@ async def checkout(payload: CheckoutRequest, request: Request):
 
         tx.qr_url = qr_url
         tx.midtrans_transaction_id = data.get("transaction_id")
+        tx.payment_type = "qris"
         tx.updated_at = utc_now()
         db.commit()
-        return {"order_id": order_id, "total": total, "payment_status": tx.payment_status, "qr_url": qr_url, "midtrans_transaction_id": tx.midtrans_transaction_id, "raw_status_code": data.get("status_code"), "mode": "midtrans", "expires_at": expires_at.isoformat() + "Z", "payment_duration_minutes": PAYMENT_DURATION_MINUTES}
+        db.refresh(tx)
+        return {**serialize_tx(db, tx), "mode": "midtrans", "raw_status_code": data.get("status_code")}
     finally:
         db.close()
 
@@ -949,7 +994,7 @@ ADMIN_HTML = r'''<!doctype html>
 .icon-disabled{display:inline-flex;align-items:center;gap:5px}.icon-disabled svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 button:disabled{cursor:not-allowed;opacity:.55}.pager-actions{display:flex;gap:7px}.pager-actions button{display:inline-flex;align-items:center;gap:5px}.pager-actions svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .db-switch{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:15px}.db-switch button{display:inline-flex;align-items:center}.db-block.hidden{display:none}.stock-inline{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px}.stock-inline input{max-width:130px}
- .admin-loading{padding:18px;color:#747982} 
+ .admin-loading{padding:18px;color:#747982}.admin-skeleton-card{min-height:78px;display:flex;flex-direction:column;justify-content:center;gap:10px}.admin-skeleton-card i,.admin-skeleton-card b,.admin-table-skeleton span{display:block;background:#eef0f4;border-radius:7px;animation:adminPulse 1.2s ease-in-out infinite alternate}.admin-skeleton-card i{width:45%;height:22px}.admin-skeleton-card b{width:65%;height:12px}.admin-table-skeleton{display:grid;gap:10px;padding:14px 0}.admin-table-skeleton span{height:38px;width:100%}@keyframes adminPulse{from{opacity:.55}to{opacity:1}} 
 .admin-dialog[hidden]{display:none}.admin-dialog{position:fixed;inset:0;z-index:5000;display:grid;place-items:center;padding:18px}.admin-dialog-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.38);backdrop-filter:blur(2px)}.admin-dialog-card{position:relative;width:min(430px,100%);background:#fff;border:1px solid #e2e4e8;border-radius:18px;padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.22)}.admin-dialog-card h3{margin:0 0 8px}.admin-dialog-card p{margin:0;white-space:pre-line;color:#4b5563;line-height:1.5}.admin-dialog-input{width:100%;box-sizing:border-box;margin-top:14px;padding:11px 12px;border:1px solid #d5d8dd;border-radius:10px;font:inherit}.admin-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.admin-dialog-actions button{min-width:84px}.admin-dialog-secondary{background:#f1f2f4!important;color:#20242b!important}
 </style>
 </head>
@@ -981,14 +1026,19 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({
     "'":'&#39;'
 }[c]));
 const blockedIcon='<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="m9 9 6 6M15 9l-6 6"/></svg>';
-const api=async(url,opt={})=>{const r=await fetch(url,opt);let d={};try{d=await r.json()}catch{}if(r.status===401){showLogin();throw new Error('')}if(!r.ok)throw new Error(d.detail||'Request gagal');return d};
-const loginPanel=document.querySelector('#loginPanel'),dashboard=document.querySelector('#dashboard');function showLogin(){loginPanel.classList.remove('hidden');dashboard.classList.add('hidden')}function showDashboard(){loginPanel.classList.add('hidden');dashboard.classList.remove('hidden');loadAll()}
+const api=async(url,opt={})=>{const r=await fetch(url,opt);let d={};try{d=await r.json()}catch{}if(r.status===401){showLogin();throw new Error('Sesi admin berakhir.')}if(!r.ok)throw new Error(d.detail||'Request gagal');return d};
+let adminDialogResolve=null;
+function closeAdminDialog(value){const el=document.querySelector('#adminDialog');if(!el||el.hidden)return;el.hidden=true;const input=document.querySelector('#adminDialogInput');const result=input.hidden?value:(value?input.value.trim():null);if(adminDialogResolve){const resolve=adminDialogResolve;adminDialogResolve=null;resolve(result);}}
+function uiAlert(message,title='Smart Canteen'){return new Promise(resolve=>{adminDialogResolve=()=>resolve();document.querySelector('#adminDialogTitle').textContent=title;document.querySelector('#adminDialogMessage').textContent=String(message??'');document.querySelector('#adminDialogInput').hidden=true;document.querySelector('#adminDialogInput').value='';document.querySelector('#adminDialogCancel').hidden=true;document.querySelector('#adminDialogOk').textContent='OK';document.querySelector('#adminDialog').hidden=false;});}
+function uiConfirm(message,title='Konfirmasi'){return new Promise(resolve=>{adminDialogResolve=value=>resolve(Boolean(value));document.querySelector('#adminDialogTitle').textContent=title;document.querySelector('#adminDialogMessage').textContent=String(message??'');document.querySelector('#adminDialogInput').hidden=true;document.querySelector('#adminDialogCancel').hidden=false;document.querySelector('#adminDialogOk').textContent='Ya';document.querySelector('#adminDialog').hidden=false;});}
+function uiPrompt(message,defaultValue='',title='Balas pesan'){return new Promise(resolve=>{adminDialogResolve=value=>resolve(value);document.querySelector('#adminDialogTitle').textContent=title;document.querySelector('#adminDialogMessage').textContent=String(message??'');const input=document.querySelector('#adminDialogInput');input.hidden=false;input.value=defaultValue??'';document.querySelector('#adminDialogCancel').hidden=false;document.querySelector('#adminDialogOk').textContent='Simpan';document.querySelector('#adminDialog').hidden=false;requestAnimationFrame(()=>{input.focus();input.select();});});}
+const loginPanel=document.querySelector('#loginPanel'),dashboard=document.querySelector('#dashboard');function showLogin(){loginPanel.classList.remove('hidden');dashboard.classList.add('hidden')}function showDashboard(){loginPanel.classList.add('hidden');dashboard.classList.remove('hidden');showAdminSkeleton();loadAll()}
 async function checkAuth(){try{const d=await api('/api/admin/me');d.authenticated?showDashboard():showLogin()}catch{showLogin()}}
 document.querySelector('#loginForm').addEventListener('submit',async e=>{e.preventDefault();const er=document.querySelector('#loginError');er.textContent='';try{await api('/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.querySelector('#username').value,password:document.querySelector('#password').value})});window.location.href=ADMIN_PANEL_PATH}catch(x){er.textContent=x.message}});document.querySelector('#logoutBtn').onclick=async()=>{await api('/api/admin/logout',{method:'POST'});showLogin()};
 const PAGE_SIZE=20;const pageState={products:1,transactions:1,support:1,database:{products:1,transactions:1,stock_movements:1,support_messages:1}};
 function pager(id,state,total,hasNext,loader){const el=document.querySelector('#'+id);if(!el)return;const prev=state<=1?`<button disabled title="Sudah di halaman pertama"><span class="icon-disabled">${blockedIcon}Sebelumnya</span></button>`:`<button onclick="${loader}(${state-1})">‹ Sebelumnya</button>`;const next=!hasNext?`<button disabled title="Tidak ada halaman berikutnya"><span class="icon-disabled">Berikutnya ${blockedIcon}</span></button>`:`<button onclick="${loader}(${state+1})">Berikutnya ›</button>`;el.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:14px"><small>Halaman ${state} · ${total} data · ${PAGE_SIZE} per halaman</small><div class="pager-actions">${prev}${next}</div></div>`}
 let editingProductId=null,stockProductId=null;
-function productRow(p){if(editingProductId===p.id)return `<tr><td colspan="6"><div class="row-edit"><input id="editName-${p.id}" value="${esc(p.name)}" placeholder="Nama"><input id="editPrice-${p.id}" type="number" min="1" value="${p.price}" placeholder="Harga"><input id="editDiscount-${p.id}" type="number" min="0" max="100" step="0.01" value="${p.discount_percent}" placeholder="Diskon %"><input id="editStock-${p.id}" type="number" min="0" step="1" value="${p.stock}" placeholder="Stok"><div class="inline-actions"><button onclick="saveProductEdit(${p.id})">Simpan</button><button onclick="cancelProductEdit()">Batal</button></div></div><small>Stok boleh diubah langsung, termasuk menjadi 0. Kalau ada unit yang sedang dipesan, stok tidak bisa diatur di bawah jumlah tersebut.</small></td></tr>`;if(stockProductId===p.id)return `<tr><td><b>${esc(p.name)}</b><br><small>ID ${p.id} · ${p.is_active?'Aktif':'Nonaktif'}</small></td><td>${rupiah(p.price)}</td><td>${p.discount_percent}%</td><td>${rupiah(p.effective_price)}</td><td><b>${p.available_stock}</b> <small>(fisik ${p.stock}, dipesan ${p.reserved_stock})</small><div class="stock-inline"><input id="stockChange-${p.id}" type="number" step="1" value="0" ${!p.is_active?'disabled':''}><input id="stockReason-${p.id}" placeholder="Alasan" value="Restock manual" ${!p.is_active?'disabled':''}></div></td><td><div class="inline-actions"><button ${!p.is_active?'disabled':''} onclick="saveStock(${p.id})">Simpan</button><button onclick="cancelStockEdit()">Batal</button></div></td></tr>`;return `<tr><td><b>${esc(p.name)}</b><br><small>ID ${p.id} · ${p.is_active?'Aktif':'Nonaktif'}${p.stock===0?' · Habis':''}</small></td><td>${rupiah(p.price)}</td><td>${p.discount_percent}%</td><td>${rupiah(p.effective_price)}</td><td>${p.available_stock} <small>(fisik ${p.stock}, dipesan ${p.reserved_stock})</small></td><td><div class="inline-actions"><button onclick="startProductEdit(${p.id})">Edit</button><button onclick="startStockEdit(${p.id})">± Stok</button><button class="danger" onclick="deleteProduct(${p.id},${JSON.stringify(p.name)})">Hapus</button></div></td></tr>`}
+function productRow(p){if(editingProductId===p.id)return `<tr><td colspan="6"><div class="row-edit"><input id="editName-${p.id}" value="${esc(p.name)}" placeholder="Nama"><input id="editPrice-${p.id}" type="number" min="1" value="${p.price}" placeholder="Harga"><input id="editDiscount-${p.id}" type="number" min="0" max="100" step="0.01" value="${p.discount_percent}" placeholder="Diskon %"><input id="editStock-${p.id}" type="number" min="0" step="1" value="${p.stock}" placeholder="Stok"><div class="inline-actions"><button onclick="saveProductEdit(${p.id})">Simpan</button><button onclick="cancelProductEdit()">Batal</button></div></div><small>Stok boleh diubah langsung, termasuk menjadi 0. Kalau ada unit yang sedang dipesan, stok tidak bisa diatur di bawah jumlah tersebut.</small></td></tr>`;if(stockProductId===p.id)return `<tr><td><b>${esc(p.name)}</b><br><small>ID ${p.id} · ${p.is_active?'Aktif':'Nonaktif'}</small></td><td>${rupiah(p.price)}</td><td>${p.discount_percent}%</td><td>${rupiah(p.effective_price)}</td><td><b>${p.available_stock}</b> <small>(fisik ${p.stock}, dipesan ${p.reserved_stock})</small><div class="stock-inline"><input id="stockChange-${p.id}" type="number" step="1" value="0" ${!p.is_active?'disabled':''}><input id="stockReason-${p.id}" placeholder="Alasan" value="Restock manual" ${!p.is_active?'disabled':''}></div></td><td><div class="inline-actions"><button ${!p.is_active?'disabled':''} onclick="saveStock(${p.id})">Simpan</button><button onclick="cancelStockEdit()">Batal</button></div></td></tr>`;return `<tr><td><b>${esc(p.name)}</b><br><small>ID ${p.id} · ${p.is_active?'Aktif':'Nonaktif'}${p.stock===0?' · Habis':''}</small></td><td>${rupiah(p.price)}</td><td>${p.discount_percent}%</td><td>${rupiah(p.effective_price)}</td><td>${p.available_stock} <small>(fisik ${p.stock}, dipesan ${p.reserved_stock})</small></td><td><div class="inline-actions"><button onclick="startProductEdit(${p.id})">Edit</button><button onclick="startStockEdit(${p.id})">± Stok</button><button class="danger" onclick="deleteProduct(${p.id})" ${p.reserved_stock>0?'disabled title="Masih ada pesanan pending untuk produk ini"':''}>Hapus</button></div></td></tr>`}
 async function loadProducts(page=pageState.products){pageState.products=Math.max(1,page);const d=await api('/api/admin/products?page='+pageState.products+'&page_size='+PAGE_SIZE);const rows=d.items||[];if(!rows.length&&pageState.products>1&&d.total>0){return loadProducts(pageState.products-1)}document.querySelector('#productsTable').innerHTML=rows.length?`<table><thead><tr><th>Produk</th><th>Harga</th><th>Diskon</th><th>Harga Jual</th><th>Stok</th><th>Aksi</th></tr></thead><tbody>${rows.map(productRow).join('')}</tbody></table>`:'<p>Belum ada produk.</p>';pager('productsPager',d.page,d.total,d.has_next,'loadProducts')}
 function startProductEdit(id){editingProductId=id;stockProductId=null;loadProducts(pageState.products)}function cancelProductEdit(){editingProductId=null;loadProducts(pageState.products)}
 async function saveProductEdit(id){const name=document.querySelector('#editName-'+id)?.value.trim();const price=Number(document.querySelector('#editPrice-'+id)?.value);const discount=Number(document.querySelector('#editDiscount-'+id)?.value);const stock=Number(document.querySelector('#editStock-'+id)?.value);if(!name||!Number.isInteger(price)||price<=0||!Number.isFinite(discount)||discount<0||discount>100||!Number.isInteger(stock)||stock<0)return uiAlert('Data produk belum valid.');try{await api('/api/admin/products/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,price,discount_percent:discount,stock,is_active:true})});editingProductId=null;await loadProducts(pageState.products);await loadSummary()}catch(e){uiAlert(e.message)}}
@@ -1018,7 +1068,10 @@ async function loadDatabaseTable(table,page=pageState.database[table]){pageState
 function loadDb_products(page){return loadDatabaseTable('products',page)}function loadDb_transactions(page){return loadDatabaseTable('transactions',page)}function loadDb_stock_movements(page){return loadDatabaseTable('stock_movements',page)}function loadDb_support_messages(page){return loadDatabaseTable('support_messages',page)}
 document.querySelectorAll('[data-db]').forEach(b=>b.onclick=()=>loadDatabaseTable(b.dataset.db,pageState.database[b.dataset.db]||1));
 async function openTab(tab){document.querySelectorAll('.tab-panel').forEach(x=>x.classList.add('hidden'));document.querySelector('#'+tab).classList.remove('hidden');if(tab==='productsTab')await loadProducts(pageState.products);else if(tab==='transactionsTab')await loadTransactions(pageState.transactions);else if(tab==='supportTab')await loadSupport(pageState.support);else if(tab==='databaseTab')await loadDatabaseTable('products',pageState.database.products)}document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>openTab(b.dataset.tab));
-async function loadSummary(){const d=await api('/api/admin/summary');document.querySelector('#summary').innerHTML=`<div class="summary-card"><strong>${d.products}</strong><span>Produk Aktif</span></div><div class="summary-card"><strong>${d.low_stock}</strong><span>Stok Menipis</span></div><div class="summary-card"><strong>${d.pending_payments}</strong><span>Pembayaran Pending</span></div><div class="summary-card"><strong>${d.today_transactions}</strong><span>Transaksi Hari Ini</span></div><div class="summary-card"><strong>${rupiah(d.today_revenue)}</strong><span>Pendapatan Hari Ini</span></div><div class="summary-card"><strong>${d.open_messages}</strong><span>Pesan Belum Dibalas</span></div>`}async function loadAll(){try{document.querySelector('#productsTable').innerHTML='<p class="admin-loading">Memuat produk...</p>';await Promise.all([loadSummary(),loadProducts(1)])}catch(e){console.error(e)}}checkAuth();
+function showAdminSkeleton(){const summary=document.querySelector('#summary');if(summary)summary.innerHTML=Array.from({length:6},()=>'<div class="summary-card admin-skeleton-card"><i></i><b></b></div>').join('');const table=document.querySelector('#productsTable');if(table)table.innerHTML='<div class="admin-table-skeleton">'+Array.from({length:6},()=>'<span></span>').join('')+'</div>';}
+async function loadSummary(){const d=await api('/api/admin/summary');document.querySelector('#summary').innerHTML=`<div class="summary-card"><strong>${d.products}</strong><span>Produk Aktif</span></div><div class="summary-card"><strong>${d.low_stock}</strong><span>Stok Menipis</span></div><div class="summary-card"><strong>${d.pending_payments}</strong><span>Pembayaran Pending</span></div><div class="summary-card"><strong>${d.today_transactions}</strong><span>Transaksi Hari Ini</span></div><div class="summary-card"><strong>${rupiah(d.today_revenue)}</strong><span>Pendapatan Hari Ini</span></div><div class="summary-card"><strong>${d.open_messages}</strong><span>Pesan Belum Dibalas</span></div>`}
+async function loadAll(){showAdminSkeleton();try{await Promise.all([loadSummary(),loadProducts(1)])}catch(e){console.error(e);uiAlert(e.message,'Dashboard gagal dimuat')}}
+const adminDialog=document.querySelector('#adminDialog');document.querySelector('#adminDialogOk').addEventListener('click',()=>closeAdminDialog(true));document.querySelector('#adminDialogCancel').addEventListener('click',()=>closeAdminDialog(false));document.querySelector('.admin-dialog-backdrop').addEventListener('click',()=>closeAdminDialog(false));checkAuth();
 </script>
 <div id="adminDialog" class="admin-dialog" hidden><div class="admin-dialog-backdrop"></div><section class="admin-dialog-card" role="dialog" aria-modal="true" aria-labelledby="adminDialogTitle"><h3 id="adminDialogTitle">Smart Canteen</h3><p id="adminDialogMessage"></p><input id="adminDialogInput" class="admin-dialog-input" hidden autocomplete="off"><div class="admin-dialog-actions"><button id="adminDialogCancel" class="admin-dialog-secondary" type="button" hidden>Batal</button><button id="adminDialogOk" type="button">OK</button></div></section></div>
 </body></html>'''

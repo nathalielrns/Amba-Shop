@@ -1,75 +1,350 @@
 <!doctype html>
 <html lang="id">
+
 <head>
+
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1">
+
   <title>Pembayaran - Smart Canteen</title>
-  <link rel="stylesheet" href="/static/style.css">
+
+  <link
+    rel="stylesheet"
+    href="/static/style.css">
+
+
   <style>
-    .payment-status{display:flex;align-items:center;gap:14px;padding:15px 16px;border:1px solid #e3e5e8;border-radius:14px;background:#fff;margin:18px 0}
-    .status-icon{width:54px;height:54px;flex:0 0 54px}.status-icon svg{width:100%;height:100%}
-    .status-ring{fill:none;stroke-width:2}.status-copy{display:flex;flex-direction:column;gap:4px}.status-copy strong{font-size:1.05rem}.status-copy span{color:#666;font-size:.92rem}
-    .status-stroke,.status-check,.status-cross{fill:none;stroke:currentColor;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round}.status-check{stroke-width:3}.status-dot{fill:currentColor}
-    .status-pending{background:#fafafa}.pending-ring{stroke:#8a8f98}.status-pending .status-icon{color:#555}
-    .status-success{border-color:#b9dfc5;background:#f3fbf5}.success-ring{stroke:#2f8f4e}.status-success .status-icon{color:#2f8f4e}
-    .status-failed{border-color:#efc0c4;background:#fff5f5}.failed-ring{stroke:#bd1e2d}.status-failed .status-icon{color:#bd1e2d}
-    .status-expired{border-color:#e4cda6;background:#fffaf0}.expired-ring{stroke:#9a6a18}.status-expired .status-icon{color:#9a6a18}
-    .status-cancelled{border-color:#d2d5da;background:#f7f8fa}.cancelled-ring{stroke:#666}.status-cancelled .status-icon{color:#666}
-    .payment-result{margin-top:14px;text-align:center}.payment-result .result-icon{width:78px;height:78px;margin:0 auto 10px}.payment-result .result-icon svg{width:100%;height:100%}
-    .payment-result h2{margin:6px 0}.payment-result p{margin:5px 0;color:#666}
+    .payment-dialog[hidden]{display:none}.payment-dialog{position:fixed;inset:0;z-index:3000;display:grid;place-items:center;padding:18px}.payment-dialog-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.38);backdrop-filter:blur(2px)}.payment-dialog-card{position:relative;width:min(420px,100%);background:#fff;border:1px solid #e2e4e8;border-radius:18px;padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.22)}.payment-dialog-card h3{margin:0 0 8px}.payment-dialog-card p{margin:0;white-space:pre-line;color:#4b5563;line-height:1.5}.payment-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.payment-dialog-actions button{min-width:84px}.payment-dialog-secondary{background:#f1f2f4!important;color:#20242b!important}
   </style>
 </head>
+
+
 <body>
-  <main class="container">
-    <section class="card">
-      <p class="eyebrow">SMART CANTEEN</p>
-      <h1>Pembayaran</h1>
-      <p>Silakan selesaikan pembayaran sebelum waktu habis.</p>
 
-      <div>
-        <p>Transaction ID: <code id="orderId">-</code></p>
-        <p>Total: <strong id="paymentTotal">Rp0</strong></p>
+  <main class="container payment-page">
+
+    <section class="payment-card card">
+
+      <!-- HEADER -->
+
+      <div class="payment-header">
+
+        <p class="eyebrow">
+          SMART CANTEEN
+        </p>
+
+        <h1>
+          Pembayaran
+        </h1>
+
+        <p class="payment-subtitle">
+          Scan QRIS untuk menyelesaikan
+          pembayaran kamu.
+        </p>
+
       </div>
 
-      <div class="card">
-        <p>Sisa waktu pembayaran:</p>
-        <h2 id="countdown">05:00</h2>
-      </div>
 
-      <div>
-        <img id="qr" class="qr hidden" alt="QRIS Payment">
-        <p id="qrMessage">Menyiapkan QRIS...</p>
-      </div>
+      <!-- TRANSACTION INFO -->
 
-      <div id="status" class="payment-status status-pending" aria-live="polite"></div>
+      <div class="payment-info">
 
-      <button id="cancelBtn" class="cancel-btn">Batal Pembayaran</button>
+        <div class="payment-info-item">
 
-      <section id="expiredBox" class="card hidden payment-result">
-        <div class="result-icon">
-          <svg viewBox="0 0 48 48" aria-hidden="true">
-            <circle cx="24" cy="24" r="21" fill="none" stroke="#bd1e2d" stroke-width="2.4"/>
-            <path d="m17 17 14 14M31 17 17 31" fill="none" stroke="#bd1e2d" stroke-width="3" stroke-linecap="round"/>
-          </svg>
+          <span>
+            Transaction ID
+          </span>
+
+          <code id="orderId">
+            -
+          </code>
+
         </div>
-        <h2>Pembayaran tidak berhasil</h2>
-        <p id="failureMessage">Transaksi tidak dapat dilanjutkan.</p>
-        <button onclick="window.location.href='/'">Kembali ke Kantin</button>
+
+
+        <div class="payment-info-item">
+
+          <span>
+            Total Pembayaran
+          </span>
+
+          <strong id="paymentTotal">
+            Rp0
+          </strong>
+
+        </div>
+
+      </div>
+
+
+      <!-- COUNTDOWN -->
+
+      <div class="payment-timer">
+
+        <span>
+          Sisa waktu pembayaran
+        </span>
+
+        <strong id="countdown">
+          05:00
+        </strong>
+
+      </div>
+
+
+      <!-- QR AREA -->
+
+      <div
+        id="qrArea"
+        class="qr-area">
+
+        <div class="qr-frame">
+
+          <img
+            id="qr"
+            class="qr hidden"
+            alt="QRIS Payment">
+
+        </div>
+
+
+        <p
+          id="qrMessage"
+          class="qr-message">
+
+          Menyiapkan QRIS...
+
+        </p>
+
+      </div>
+
+
+      <!-- WAITING STATUS -->
+
+      <div
+        id="waitingStatus"
+        class="payment-status waiting">
+
+        <span class="status-dot"></span>
+
+        <span id="status">
+          Menunggu pembayaran...
+        </span>
+
+      </div>
+
+
+      <!-- CANCEL -->
+
+      <button
+        id="cancelBtn"
+        class="payment-cancel-btn"
+        type="button">
+
+        Batal Pembayaran
+
+      </button>
+
+
+      <!-- ERROR -->
+
+      <div
+        id="qrError"
+        class="payment-error hidden">
+      </div>
+
+
+      <!-- SUCCESS RESULT -->
+
+      <section
+        id="successBox"
+        class="payment-result success-result hidden">
+
+        <div class="result-icon">
+
+          <svg
+            viewBox="0 0 24 24"
+            aria-hidden="true">
+
+            <path
+              d="M20 6 9 17l-5-5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"/>
+
+          </svg>
+
+        </div>
+
+
+        <p class="result-label">
+          TRANSAKSI SELESAI
+        </p>
+
+
+        <h2>
+          Pembayaran Berhasil
+        </h2>
+
+
+        <p class="result-description">
+          Pembayaran kamu sudah diterima
+          dan transaksi berhasil dicatat.
+        </p>
+
+
+        <div class="result-summary">
+
+          <div>
+
+            <span>
+              Transaction ID
+            </span>
+
+            <strong id="successOrderId">
+              -
+            </strong>
+
+          </div>
+
+
+          <div>
+
+            <span>
+              Total
+            </span>
+
+            <strong id="successTotal">
+              Rp0
+            </strong>
+
+          </div>
+
+        </div>
+
+
+        <button
+          class="result-primary-btn"
+          type="button"
+          onclick="window.location.href='/'">
+
+          Kembali ke Kantin
+
+        </button>
+
+
+        <p class="redirect-note">
+          Kembali otomatis dalam
+          beberapa detik...
+        </p>
+
       </section>
 
-      <section id="successBox" class="card hidden payment-result">
+
+      <!-- FAILED / EXPIRED / CANCELLED RESULT -->
+
+      <section
+        id="expiredBox"
+        class="payment-result failed-result hidden">
+
         <div class="result-icon">
-          <svg viewBox="0 0 48 48" aria-hidden="true">
-            <circle cx="24" cy="24" r="21" fill="none" stroke="#2f8f4e" stroke-width="2.4"/>
-            <path d="m14 24 6.5 6.5L34 17" fill="none" stroke="#2f8f4e" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+          <svg
+            viewBox="0 0 24 24"
+            aria-hidden="true">
+
+            <path
+              d="M18 6 6 18M6 6l12 12"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.5"
+              stroke-linecap="round"/>
+
           </svg>
+
         </div>
-        <h2>Pembayaran berhasil</h2>
-        <p>Transaksi sudah tercatat di sistem.</p>
-        <p>Mengarahkan kembali ke kantin...</p>
+
+
+        <p
+          id="failedLabel"
+          class="result-label">
+
+          TRANSAKSI TIDAK SELESAI
+
+        </p>
+
+
+        <h2 id="failedTitle">
+          Pembayaran Kedaluwarsa
+        </h2>
+
+
+        <p
+          id="failedDescription"
+          class="result-description">
+
+          Waktu pembayaran sudah habis.
+          QRIS ini tidak dapat digunakan lagi.
+
+        </p>
+
+
+        <div class="result-summary">
+
+          <div>
+
+            <span>
+              Transaction ID
+            </span>
+
+            <strong id="failedOrderId">
+              -
+            </strong>
+
+          </div>
+
+
+          <div>
+
+            <span>
+              Total
+            </span>
+
+            <strong id="failedTotal">
+              Rp0
+            </strong>
+
+          </div>
+
+        </div>
+
+
+        <button
+          class="result-primary-btn"
+          type="button"
+          onclick="window.location.href='/'">
+
+          Kembali ke Kantin
+
+        </button>
+
       </section>
+
     </section>
+
+  <div id="paymentDialog" class="payment-dialog" hidden><div class="payment-dialog-backdrop"></div><section class="payment-dialog-card" role="dialog" aria-modal="true" aria-labelledby="paymentDialogTitle"><h3 id="paymentDialogTitle">Konfirmasi</h3><p id="paymentDialogMessage"></p><div class="payment-dialog-actions"><button id="paymentDialogCancel" class="payment-dialog-secondary" type="button">Batal</button><button id="paymentDialogOk" type="button">Ya</button></div></section></div>
+
+
   </main>
+
+
   <script src="/static/payment.js"></script>
+
 </body>
+
 </html>
