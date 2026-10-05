@@ -297,13 +297,15 @@ async function startPaymentPage() {
   if (!storedOrder) localStorage.setItem(ACTIVE_ORDER_KEY, orderId);
 
   try {
+    // Start QRIS preparation immediately while the first transaction GET is loading.
+    const preparing = preparePayment();
     const data = await loadTransaction();
     if (data.payment_status === "success") return paymentSuccess();
     if (["expired", "failed", "cancelled"].includes(data.payment_status)) return paymentFinished(data.payment_status);
 
     startCountdown();
-    preparePayment();
     startPolling();
+    await preparing;
   } catch (error) {
     statusEl.textContent = error.message;
   }

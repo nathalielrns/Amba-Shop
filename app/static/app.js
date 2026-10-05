@@ -308,7 +308,10 @@ function injectSupportStyles() {
 
     .support-panel-close{
       width:40px;
-      height:34px;
+      height:40px;
+      min-width:40px;
+      flex:0 0 40px;
+      padding:0;
 
       border:0;
       border-radius:50%;
@@ -406,6 +409,7 @@ function injectSupportStyles() {
 
     .support-list-title{
       font-weight:700;
+      color:#111318;
 
       white-space:nowrap;
       overflow:hidden;
@@ -414,7 +418,7 @@ function injectSupportStyles() {
 
     .support-list-meta{
       font-size:.78rem;
-      color:#7a7f87;
+      color:#626873;
 
       margin-top:4px;
     }
@@ -2193,17 +2197,15 @@ async function sendSupport(){
     }
 
 
+    // Reset every support field after a successful send.
+    document.querySelector("#supportMessage").value = "";
+    document.querySelector("#supportContact").value = "";
+    document.querySelector("#supportOrderId").value = "";
+
     uiAlert(data.message,"Pesan terkirim");
 
-
-    document
-      .querySelector(
-        "#supportMessage"
-      )
-      .value = "";
-
-
-    await loadSupportMessages();
+    // Refresh in the background so the form is not blocked by the follow-up GET.
+    loadSupportMessages(false);
 
 
   }catch(e){
