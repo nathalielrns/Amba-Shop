@@ -2427,7 +2427,7 @@ readSupportCache();
 renderCart();
 
 
-loadProducts()
+loadProducts(true)
   .catch(
     e => {
 
