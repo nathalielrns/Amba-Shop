@@ -5,14 +5,17 @@ import json
 import os
 import secrets
 import uuid
-from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from html import escape
+from io import BytesIO
+from urllib.parse import quote
+
+import qrcode
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -31,21 +34,24 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 load_dotenv()
 
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-LOCAL_DATABASE_PATH = BASE_DIR.parent / "smart_canteen.db"
-
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{LOCAL_DATABASE_PATH.as_posix()}").strip()
-# Neon and other Postgres providers may expose either postgres:// or postgresql://.
-# SQLAlchemy 2.x with psycopg uses the explicit postgresql+psycopg driver.
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgres://"):]
-elif DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgresql://"):]
-
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./smart_canteen.db")
 MIDTRANS_SERVER_KEY = os.getenv("MIDTRANS_SERVER_KEY", "").strip()
 IS_PRODUCTION = os.getenv("MIDTRANS_IS_PRODUCTION", "false").lower() == "true"
 MIDTRANS_BASE_URL = "https://api.midtrans.com" if IS_PRODUCTION else "https://api.sandbox.midtrans.com"
+
+# Duitku Sandbox / Production
+DUITKU_MERCHANT_CODE = os.getenv("DUITKU_MERCHANT_CODE", "").strip()
+DUITKU_API_KEY = os.getenv("DUITKU_API_KEY", "").strip()
+DUITKU_ENV = os.getenv("DUITKU_ENV", "sandbox").strip().lower()
+DUITKU_PAYMENT_METHOD = os.getenv("DUITKU_PAYMENT_METHOD", "").strip().upper()
+DUITKU_CALLBACK_URL = os.getenv("DUITKU_CALLBACK_URL", "https://amba-shop-eta.vercel.app/callback").strip()
+DUITKU_RETURN_URL = os.getenv("DUITKU_RETURN_URL", "https://amba-shop-eta.vercel.app/payment.html").strip()
+DUITKU_CUSTOMER_EMAIL = os.getenv("DUITKU_CUSTOMER_EMAIL", "test@example.com").strip()
+DUITKU_BASE_URL = (
+    "https://sandbox.duitku.com"
+    if DUITKU_ENV != "production"
+    else "https://passport.duitku.com"
+)
 PAYMENT_DURATION_MINUTES = 5
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
@@ -62,7 +68,6 @@ ADMIN_SESSION_MINUTES = int(
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
-    pool_pre_ping=True,
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
@@ -184,13 +189,8 @@ def seed_products():
 
 seed_products()
 
-app = FastAPI(title="Smart Canteen API", version="1.0.0")
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-
-@app.get("/api/health")
-def health_check():
-    return {"ok": True, "service": "smart-canteen"}
+app = FastAPI(title="Smart Canteen API", version="1.1.0-duitku")
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
 # =========================
@@ -315,12 +315,12 @@ def finalize_failure(db, tx, status="failed"):
 # =========================
 @app.get("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse("app/static/index.html")
 
 
 @app.get("/payment.html")
 def payment_page():
-    return FileResponse(STATIC_DIR / "payment.html")
+    return FileResponse("app/static/payment.html")
 
 @app.get(
     ADMIN_PANEL_PATH,
@@ -384,15 +384,65 @@ class SupportReplyRequest(BaseModel):
 
 
 # =========================
-# MIDTRANS
+# DUITKU
 # =========================
-def midtrans_auth_headers():
-    if not MIDTRANS_SERVER_KEY:
-        raise HTTPException(status_code=500, detail="MIDTRANS_SERVER_KEY belum diisi di file .env")
-    token = base64.b64encode(f"{MIDTRANS_SERVER_KEY}:".encode()).decode()
-    return {"Authorization": f"Basic {token}", "Content-Type": "application/json", "Accept": "application/json"}
+def duitku_signature(value: str) -> str:
+    return hmac.new(
+        DUITKU_API_KEY.encode("utf-8"),
+        value.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
+async def get_duitku_qris_method(amount: int) -> str:
+    if DUITKU_PAYMENT_METHOD:
+        if DUITKU_PAYMENT_METHOD not in {"SP", "NQ", "SQ"}:
+            raise HTTPException(
+                status_code=500,
+                detail="DUITKU_PAYMENT_METHOD harus SP, NQ, atau SQ untuk QRIS.",
+            )
+        return DUITKU_PAYMENT_METHOD
+
+    jakarta_now = datetime.now(timezone(timedelta(hours=7)))
+    duitku_datetime = jakarta_now.strftime("%Y-%m-%d %H:%M:%S")
+    signature = duitku_signature(f"{DUITKU_MERCHANT_CODE}{amount}{duitku_datetime}")
+    body = {
+        "merchantcode": DUITKU_MERCHANT_CODE,
+        "amount": amount,
+        "datetime": duitku_datetime,
+        "signature": signature,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                f"{DUITKU_BASE_URL}/webapi/api/merchant/paymentmethod/getpaymentmethod",
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                json=body,
+            )
+        data = response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Gagal mengambil metode pembayaran Duitku: {exc}")
+
+    if response.status_code >= 400 or str(data.get("responseCode", "")) != "00":
+        raise HTTPException(status_code=502, detail={
+            "message": "Gagal mengambil metode pembayaran aktif dari Duitku.",
+            "duitku": data,
+        })
+
+    available = {str(row.get("paymentMethod", "")).upper() for row in data.get("paymentFee", [])}
+    for candidate in ("SP", "NQ", "SQ"):
+        if candidate in available:
+            return candidate
+
+    raise HTTPException(
+        status_code=503,
+        detail="Tidak ada metode QRIS aktif (SP/NQ/SQ) pada proyek Duitku ini.",
+    )
+
+
+# =========================
+# MIDTRANS LEGACY WEBHOOK
+# =========================
 # =========================
 # CUSTOMER PRODUCTS
 # =========================
@@ -450,39 +500,107 @@ async def checkout(payload: CheckoutRequest):
         db.commit()
         db.refresh(tx)
 
-        if not MIDTRANS_SERVER_KEY:
-            return {"order_id": order_id, "total": total, "payment_status": "pending", "qr_url": None, "midtrans_transaction_id": None, "mode": "local", "expires_at": expires_at.isoformat() + "Z", "payment_duration_minutes": PAYMENT_DURATION_MINUTES}
+        if not DUITKU_MERCHANT_CODE or not DUITKU_API_KEY:
+            return {
+                "order_id": order_id,
+                "total": total,
+                "payment_status": "pending",
+                "qr_url": None,
+                "midtrans_transaction_id": None,
+                "mode": "local",
+                "expires_at": expires_at.isoformat() + "Z",
+                "payment_duration_minutes": PAYMENT_DURATION_MINUTES,
+            }
 
-        item_details = [{"id": str(p.id), "price": effective, "quantity": quantity, "name": p.name} for p, quantity, effective in products]
-        body = {"payment_type": "qris", "transaction_details": {"order_id": order_id, "gross_amount": total}, "item_details": item_details, "qris": {"acquirer": "gopay"}}
+        payment_method = await get_duitku_qris_method(total)
+        callback_url = DUITKU_CALLBACK_URL
+        return_url = f"{DUITKU_RETURN_URL}{'&' if '?' in DUITKU_RETURN_URL else '?'}order_id={quote(order_id)}"
+        item_details = [
+            {
+                "name": p.name,
+                "price": effective,
+                "quantity": quantity,
+            }
+            for p, quantity, effective in products
+        ]
+        string_to_sign = f"{DUITKU_MERCHANT_CODE}{order_id}{total}"
+        signature = hmac.new(
+            DUITKU_API_KEY.encode("utf-8"),
+            string_to_sign.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        body = {
+            "merchantCode": DUITKU_MERCHANT_CODE,
+            "paymentAmount": total,
+            "paymentMethod": payment_method,
+            "merchantOrderId": order_id,
+            "productDetails": "Pembayaran Amba Shop",
+            "email": DUITKU_CUSTOMER_EMAIL,
+            "customerVaName": "Amba Shop",
+            "itemDetails": item_details,
+            "callbackUrl": callback_url,
+            "returnUrl": return_url,
+            "signature": signature,
+            "expiryPeriod": PAYMENT_DURATION_MINUTES,
+        }
 
         try:
             async with httpx.AsyncClient(timeout=20) as client:
-                response = await client.post(f"{MIDTRANS_BASE_URL}/v2/charge", headers=midtrans_auth_headers(), json=body)
-            data = response.json()
+                response = await client.post(
+                    f"{DUITKU_BASE_URL}/webapi/api/merchant/v2/inquiry",
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                    json=body,
+                )
+            try:
+                data = response.json()
+            except ValueError:
+                data = {"raw": response.text}
         except Exception as exc:
             finalize_failure(db, tx, "failed")
             db.commit()
-            raise HTTPException(status_code=502, detail=f"Midtrans request failed: {exc}")
+            raise HTTPException(status_code=502, detail=f"Duitku request failed: {exc}")
 
-        if response.status_code >= 400:
+        if response.status_code >= 400 or str(data.get("statusCode", "00")) not in ("00", "0"):
             finalize_failure(db, tx, "failed")
             db.commit()
-            raise HTTPException(status_code=502, detail=data)
+            raise HTTPException(status_code=502, detail={
+                "message": "Duitku menolak transaksi.",
+                "duitku": data,
+            })
 
-        qr_url = None
-        for action in data.get("actions", []):
-            name = (action.get("name") or "").lower()
-            if name in ("generate-qr-code", "generate-qr-code-v2") or "qr" in name:
-                qr_url = action.get("url")
-                if qr_url:
-                    break
+        qr_string = data.get("qrString")
+        if not qr_string:
+            finalize_failure(db, tx, "failed")
+            db.commit()
+            raise HTTPException(status_code=502, detail="Duitku tidak mengembalikan qrString.")
+
+        try:
+            qr_image = qrcode.make(qr_string)
+            buffer = BytesIO()
+            qr_image.save(buffer, format="PNG")
+            qr_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+        except Exception as exc:
+            finalize_failure(db, tx, "failed")
+            db.commit()
+            raise HTTPException(status_code=500, detail=f"Gagal membuat gambar QRIS: {exc}")
 
         tx.qr_url = qr_url
-        tx.midtrans_transaction_id = data.get("transaction_id")
+        tx.midtrans_transaction_id = data.get("reference") or data.get("publisherOrderId")
+        tx.payment_type = payment_method
         tx.updated_at = utc_now()
         db.commit()
-        return {"order_id": order_id, "total": total, "payment_status": tx.payment_status, "qr_url": qr_url, "midtrans_transaction_id": tx.midtrans_transaction_id, "raw_status_code": data.get("status_code"), "mode": "midtrans", "expires_at": expires_at.isoformat() + "Z", "payment_duration_minutes": PAYMENT_DURATION_MINUTES}
+        return {
+            "order_id": order_id,
+            "total": total,
+            "payment_status": tx.payment_status,
+            "qr_url": qr_url,
+            "midtrans_transaction_id": tx.midtrans_transaction_id,
+            "raw_status_code": data.get("statusCode"),
+            "mode": "duitku",
+            "payment_method": payment_method,
+            "expires_at": expires_at.isoformat() + "Z",
+            "payment_duration_minutes": PAYMENT_DURATION_MINUTES,
+        }
     finally:
         db.close()
 
@@ -531,25 +649,37 @@ def cancel_transaction(order_id: str):
 
 
 # =========================
-# MIDTRANS WEBHOOK
+# DUITKU CALLBACK
 # =========================
-@app.post("/api/midtrans/notification")
-async def midtrans_notification(request: Request):
-    payload = await request.json()
-    order_id = payload.get("order_id")
-    status_code = str(payload.get("status_code", ""))
-    gross_amount = str(payload.get("gross_amount", ""))
-    signature_key = payload.get("signature_key", "")
-    transaction_status = payload.get("transaction_status", "")
+@app.post("/callback", response_class=PlainTextResponse)
+async def duitku_callback(request: Request):
+    raw_body = await request.body()
+    from urllib.parse import parse_qs
+    parsed = parse_qs(raw_body.decode("utf-8"), keep_blank_values=True)
+    payload = {key: values[-1] if values else "" for key, values in parsed.items()}
 
-    if not order_id:
-        raise HTTPException(status_code=400, detail="order_id missing")
+    merchant_code = payload.get("merchantCode", "").strip()
+    amount = payload.get("amount", "").strip()
+    order_id = payload.get("merchantOrderId", "").strip()
+    result_code = payload.get("resultCode", "").strip()
+    reference = payload.get("reference", "").strip()
+    signature = payload.get("signature", "").strip()
 
-    if MIDTRANS_SERVER_KEY:
-        raw = f"{order_id}{status_code}{gross_amount}{MIDTRANS_SERVER_KEY}"
-        expected = hashlib.sha512(raw.encode()).hexdigest()
-        if not hmac.compare_digest(expected, signature_key):
-            raise HTTPException(status_code=403, detail="Invalid signature")
+    if not merchant_code or not amount or not order_id or not signature:
+        raise HTTPException(status_code=400, detail="Parameter callback Duitku tidak lengkap.")
+    if not DUITKU_MERCHANT_CODE or not DUITKU_API_KEY:
+        raise HTTPException(status_code=500, detail="Konfigurasi Duitku belum lengkap.")
+    if not hmac.compare_digest(merchant_code, DUITKU_MERCHANT_CODE):
+        raise HTTPException(status_code=403, detail="Merchant code tidak valid.")
+
+    expected_signature = duitku_signature(f"{merchant_code}{amount}{order_id}")
+    if not hmac.compare_digest(expected_signature, signature):
+        raise HTTPException(status_code=403, detail="Signature callback Duitku tidak valid.")
+
+    try:
+        callback_amount = int(float(amount))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Amount callback tidak valid.")
 
     db = SessionLocal()
     try:
@@ -557,24 +687,32 @@ async def midtrans_notification(request: Request):
         if not tx:
             raise HTTPException(status_code=404, detail="Transaction not found")
 
-        if tx.payment_status in ("cancelled", "expired", "failed", "success"):
-            return {"status": "ignored", "payment_status": tx.payment_status}
+        if callback_amount != tx.total:
+            raise HTTPException(status_code=400, detail="Nominal callback tidak sama dengan nominal transaksi.")
+
+        if tx.payment_status in ("success", "expired", "failed", "cancelled"):
+            return "SUCCESS"
 
         if tx.expires_at and utc_now() >= tx.expires_at:
             finalize_failure(db, tx, "expired")
             db.commit()
-            return {"status": "expired", "order_id": order_id}
+            return "SUCCESS"
 
-        tx.midtrans_transaction_id = payload.get("transaction_id") or tx.midtrans_transaction_id
-        tx.payment_type = payload.get("payment_type") or tx.payment_type
+        if reference:
+            tx.midtrans_transaction_id = reference
+        if payload.get("paymentCode"):
+            tx.payment_type = payload.get("paymentCode")
 
-        if transaction_status in ("settlement", "capture"):
+        if result_code == "00":
             finalize_success(db, tx, tx.payment_type or "qris")
-        elif transaction_status in ("cancel", "deny", "expire", "failure"):
+        elif result_code == "01":
             finalize_failure(db, tx, "failed")
-        tx.updated_at = utc_now()
+        else:
+            # Callback code selain 00/01 tidak boleh dianggap sukses.
+            tx.updated_at = utc_now()
+
         db.commit()
-        return {"status": "ok", "order_id": order_id, "payment_status": tx.payment_status}
+        return "SUCCESS"
     finally:
         db.close()
 
@@ -599,7 +737,7 @@ def create_support(payload: SupportRequest, request: Request):
         db.commit()
         db.refresh(msg)
         result = JSONResponse({"id": msg.id, "status": msg.status, "message": "Pesan berhasil dikirim ke admin."})
-        result.set_cookie("support_client_id", client_id, max_age=31536000, httponly=True, samesite="lax", secure=request.url.scheme == "https")
+        result.set_cookie("support_client_id", client_id, max_age=31536000, httponly=True, samesite="lax", secure=False)
         return result
     finally:
         db.close()
@@ -639,7 +777,7 @@ def get_support(request: Request):
                 "transaction": tx_info,
             })
         response = JSONResponse(payload)
-        response.set_cookie("support_client_id", client_id, max_age=31536000, httponly=True, samesite="lax", secure=request.url.scheme == "https")
+        response.set_cookie("support_client_id", client_id, max_age=31536000, httponly=True, samesite="lax", secure=False)
         return response
     finally:
         db.close()
@@ -648,7 +786,7 @@ def get_support(request: Request):
 # ADMIN AUTH
 # =========================
 @app.post("/api/admin/login")
-def admin_login(payload: AdminLoginRequest, request: Request):
+def admin_login(payload: AdminLoginRequest):
     if not hmac.compare_digest(payload.username, ADMIN_USERNAME) or not hmac.compare_digest(payload.password, ADMIN_PASSWORD):
         raise HTTPException(status_code=401, detail="Username atau password salah.")
 
@@ -659,7 +797,7 @@ def admin_login(payload: AdminLoginRequest, request: Request):
         make_admin_token(),
         httponly=True,
         samesite="lax",
-        secure=request.url.scheme == "https",
+        secure=False,
         max_age=ADMIN_SESSION_MINUTES * 60
     )
 
@@ -780,42 +918,21 @@ def admin_change_stock(product_id: int, payload: StockRequest, request: Request)
         db.close()
 
 
-
 @app.delete("/api/admin/products/{product_id}")
 def admin_delete_product(product_id: int, request: Request):
     require_admin(request)
     db = SessionLocal()
     try:
-        product = db.query(Product).filter(Product.id == product_id).first()
-        if not product:
+        p = db.query(Product).filter(Product.id == product_id).first()
+        if not p:
             raise HTTPException(status_code=404, detail="Produk tidak ditemukan.")
-
-        if product.reserved_stock > 0:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Produk masih memiliki {product.reserved_stock} unit "
-                    "yang sedang dipesan. Selesaikan atau batalkan transaksi "
-                    "terlebih dahulu."
-                ),
-            )
-
-        # TransactionItem sengaja tidak memakai FK ke Product.
-        # Snapshot nama/harga transaksi lama tetap aman ketika Product dihapus.
-        db.query(StockMovement).filter(
-            StockMovement.product_id == product_id
-        ).delete(synchronize_session=False)
-
-        db.delete(product)
+        if p.reserved_stock > 0:
+            raise HTTPException(status_code=409, detail="Produk masih punya stok yang sedang dipesan.")
+        # product_id pada transaction_items dan stock_movements tidak memakai FK,
+        # sehingga histori tetap aman walaupun baris produk benar-benar dihapus.
+        db.delete(p)
         db.commit()
-
-        return {"ok": True, "deleted_product_id": product_id}
-    except HTTPException:
-        db.rollback()
-        raise
-    except Exception:
-        db.rollback()
-        raise
+        return {"ok": True, "deleted": product_id}
     finally:
         db.close()
 
@@ -942,7 +1059,7 @@ button:disabled{cursor:not-allowed;opacity:.55}.pager-actions{display:flex;gap:7
 <button data-tab="supportTab"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-10.9 6.7L4 20l1.8-4.2A7.5 7.5 0 1 1 20 11.5Z"/><path d="M8 11.5h.01M12 11.5h.01M16 11.5h.01"/></svg>Pesan User</button>
 <button data-tab="databaseTab"><svg class="ui-icon" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"/></svg>Database</button>
 </div>
-<section id="productsTab" class="admin-card tab-panel"><div class="section-head"><div><h2>Produk</h2><p>Tambah produk, edit langsung pada baris, kelola stok, atau hapus produk permanen.</p></div></div><form id="productForm" class="product-form"><input id="pName" placeholder="Nama produk" required><input id="pPrice" type="number" min="1" placeholder="Harga" required><input id="pDiscount" type="number" min="0" max="100" step="0.01" placeholder="Diskon %" value="0" required><input id="pStock" type="number" min="0" placeholder="Stok awal" value="0" required><button type="submit">Tambah Produk</button></form><div id="productsTable" class="table-wrap"></div><div id="productsPager"></div></section>
+<section id="productsTab" class="admin-card tab-panel"><div class="section-head"><div><h2>Produk</h2><p>Tambah produk, edit langsung pada baris, dan kelola stok tanpa tab terpisah.</p></div></div><form id="productForm" class="product-form"><input id="pName" placeholder="Nama produk" required><input id="pPrice" type="number" min="1" placeholder="Harga" required><input id="pDiscount" type="number" min="0" max="100" step="0.01" placeholder="Diskon %" value="0" required><input id="pStock" type="number" min="0" placeholder="Stok awal" value="0" required><button type="submit">Tambah Produk</button></form><div id="productsTable" class="table-wrap"></div><div id="productsPager"></div></section>
 <section id="transactionsTab" class="admin-card tab-panel hidden"><div class="section-head"><div><h2>Verifikasi Pembayaran</h2><p>Transaksi pending bisa diverifikasi manual sebagai berhasil atau ditolak.</p></div><select id="txFilter"><option value="all">Semua</option><option value="pending">Pending</option><option value="success">Success</option><option value="failed">Failed</option><option value="expired">Expired</option><option value="cancelled">Cancelled</option></select></div><div id="transactionsTable" class="table-wrap"></div><div id="transactionsPager"></div></section>
 <section id="supportTab" class="admin-card tab-panel hidden"><div class="section-head"><div><h2>Pesan User</h2><p>Pesan terhubung ke browser/device pengirim melalui cookie anonim.</p></div></div><div id="supportTable" class="table-wrap"></div><div id="supportPager"></div></section>
 <section id="databaseTab" class="admin-card tab-panel hidden"><div class="section-head"><div><h2>Data Aplikasi</h2><p>Read-only. Hanya tabel yang dipilih yang dimuat, 20 data per halaman.</p></div></div><div class="db-switch"><button data-db="products"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M21 8 12 3 3 8l9 5 9-5Z"/><path d="M3 8v8l9 5 9-5V8"/></svg>Produk</button><button data-db="transactions"><svg class="ui-icon" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/></svg>Pembayaran</button><button data-db="stock_movements"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M4 19V9M10 19V5M16 19v-7M22 19H2"/></svg>Riwayat Stok</button><button data-db="support_messages"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-10.9 6.7L4 20l1.8-4.2A7.5 7.5 0 1 1 20 11.5Z"/></svg>Pesan</button></div><div id="db-products" class="database-block db-block"></div><div id="db-transactions" class="database-block db-block hidden"></div><div id="db-stock_movements" class="database-block db-block hidden"></div><div id="db-support_messages" class="database-block db-block hidden"></div></section>
@@ -950,13 +1067,7 @@ button:disabled{cursor:not-allowed;opacity:.55}.pager-actions{display:flex;gap:7
 <script>
 const ADMIN_PANEL_PATH='/management-7xK92';
 const rupiah=n=>new Intl.NumberFormat('id-ID',{style:'currency',currency:'IDR',maximumFractionDigits:0}).format(n||0);
-const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({
-    '&':'&amp;',
-    '<':'&lt;',
-    '>':'&gt;',
-    '"':'&quot;',
-    "'":'&#39;'
-}[c]));
+const esc=s=>String(s??'').replace(/[&<>\'\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','\"':'&quot;'}[c]));
 const blockedIcon='<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="m9 9 6 6M15 9l-6 6"/></svg>';
 const api=async(url,opt={})=>{const r=await fetch(url,opt);let d={};try{d=await r.json()}catch{}if(r.status===401){showLogin();throw new Error('')}if(!r.ok)throw new Error(d.detail||'Request gagal');return d};
 const loginPanel=document.querySelector('#loginPanel'),dashboard=document.querySelector('#dashboard');function showLogin(){loginPanel.classList.remove('hidden');dashboard.classList.add('hidden')}function showDashboard(){loginPanel.classList.add('hidden');dashboard.classList.remove('hidden');loadAll()}
@@ -965,26 +1076,13 @@ document.querySelector('#loginForm').addEventListener('submit',async e=>{e.preve
 const PAGE_SIZE=20;const pageState={products:1,transactions:1,support:1,database:{products:1,transactions:1,stock_movements:1,support_messages:1}};
 function pager(id,state,total,hasNext,loader){const el=document.querySelector('#'+id);if(!el)return;const prev=state<=1?`<button disabled title="Sudah di halaman pertama"><span class="icon-disabled">${blockedIcon}Sebelumnya</span></button>`:`<button onclick="${loader}(${state-1})">‹ Sebelumnya</button>`;const next=!hasNext?`<button disabled title="Tidak ada halaman berikutnya"><span class="icon-disabled">Berikutnya ${blockedIcon}</span></button>`:`<button onclick="${loader}(${state+1})">Berikutnya ›</button>`;el.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:14px"><small>Halaman ${state} · ${total} data · ${PAGE_SIZE} per halaman</small><div class="pager-actions">${prev}${next}</div></div>`}
 let editingProductId=null,stockProductId=null;
-function productRow(p){if(editingProductId===p.id)return `<tr><td colspan="6"><div class="row-edit"><input id="editName-${p.id}" value="${esc(p.name)}" placeholder="Nama"><input id="editPrice-${p.id}" type="number" min="1" value="${p.price}" placeholder="Harga"><input id="editDiscount-${p.id}" type="number" min="0" max="100" step="0.01" value="${p.discount_percent}" placeholder="Diskon %"><input id="editStock-${p.id}" type="number" min="0" step="1" value="${p.stock}" placeholder="Stok"><div class="inline-actions"><button onclick="saveProductEdit(${p.id})">Simpan</button><button onclick="cancelProductEdit()">Batal</button></div></div><small>Stok boleh diubah langsung, termasuk menjadi 0. Kalau ada unit yang sedang dipesan, stok tidak bisa diatur di bawah jumlah tersebut.</small></td></tr>`;if(stockProductId===p.id)return `<tr><td><b>${esc(p.name)}</b><br><small>ID ${p.id} · ${p.is_active?'Aktif':'Nonaktif'}</small></td><td>${rupiah(p.price)}</td><td>${p.discount_percent}%</td><td>${rupiah(p.effective_price)}</td><td><b>${p.available_stock}</b> <small>(fisik ${p.stock}, dipesan ${p.reserved_stock})</small><div class="stock-inline"><input id="stockChange-${p.id}" type="number" step="1" value="0" ${!p.is_active?'disabled':''}><input id="stockReason-${p.id}" placeholder="Alasan" value="Restock manual" ${!p.is_active?'disabled':''}></div></td><td><div class="inline-actions"><button ${!p.is_active?'disabled':''} onclick="saveStock(${p.id})">Simpan</button><button onclick="cancelStockEdit()">Batal</button></div></td></tr>`;return `<tr><td><b>${esc(p.name)}</b><br><small>ID ${p.id} · ${p.is_active?'Aktif':'Nonaktif'}${p.stock===0?' · Habis':''}</small></td><td>${rupiah(p.price)}</td><td>${p.discount_percent}%</td><td>${rupiah(p.effective_price)}</td><td>${p.available_stock} <small>(fisik ${p.stock}, dipesan ${p.reserved_stock})</small></td><td><div class="inline-actions"><button onclick="startProductEdit(${p.id})">Edit</button><button onclick="startStockEdit(${p.id})">± Stok</button><button class="danger" onclick="deleteProduct(${p.id})" ${p.reserved_stock>0?'disabled title="Masih ada pesanan pending untuk produk ini"':''}>Hapus</button></div></td></tr>`}
-async function loadProducts(page=pageState.products){pageState.products=Math.max(1,page);const d=await api('/api/admin/products?page='+pageState.products+'&page_size='+PAGE_SIZE);const rows=d.items||[];if(!rows.length&&pageState.products>1&&d.total>0){return loadProducts(pageState.products-1)}document.querySelector('#productsTable').innerHTML=rows.length?`<table><thead><tr><th>Produk</th><th>Harga</th><th>Diskon</th><th>Harga Jual</th><th>Stok</th><th>Aksi</th></tr></thead><tbody>${rows.map(productRow).join('')}</tbody></table>`:'<p>Belum ada produk.</p>';pager('productsPager',d.page,d.total,d.has_next,'loadProducts')}
+function productRow(p){if(editingProductId===p.id)return `<tr><td colspan="6"><div class="row-edit"><input id="editName-${p.id}" value="${esc(p.name)}" placeholder="Nama"><input id="editPrice-${p.id}" type="number" min="1" value="${p.price}" placeholder="Harga"><input id="editDiscount-${p.id}" type="number" min="0" max="100" step="0.01" value="${p.discount_percent}" placeholder="Diskon %"><input id="editStock-${p.id}" type="number" min="0" step="1" value="${p.stock}" placeholder="Stok"><div class="inline-actions"><button onclick="saveProductEdit(${p.id})">Simpan</button><button onclick="cancelProductEdit()">Batal</button></div></div><small>Stok boleh diubah langsung, termasuk menjadi 0. Kalau ada unit yang sedang dipesan, stok tidak bisa diatur di bawah jumlah tersebut.</small></td></tr>`;if(stockProductId===p.id)return `<tr><td><b>${esc(p.name)}</b><br><small>ID ${p.id} · ${p.is_active?'Aktif':'Nonaktif'}</small></td><td>${rupiah(p.price)}</td><td>${p.discount_percent}%</td><td>${rupiah(p.effective_price)}</td><td><b>${p.available_stock}</b> <small>(fisik ${p.stock}, dipesan ${p.reserved_stock})</small><div class="stock-inline"><input id="stockChange-${p.id}" type="number" step="1" value="0" ${!p.is_active?'disabled':''}><input id="stockReason-${p.id}" placeholder="Alasan" value="Restock manual" ${!p.is_active?'disabled':''}></div></td><td><div class="inline-actions"><button ${!p.is_active?'disabled':''} onclick="saveStock(${p.id})">Simpan</button><button onclick="cancelStockEdit()">Batal</button></div></td></tr>`;return `<tr><td><b>${esc(p.name)}</b><br><small>ID ${p.id} · ${p.is_active?'Aktif':'Nonaktif'}${p.stock===0?' · Habis':''}</small></td><td>${rupiah(p.price)}</td><td>${p.discount_percent}%</td><td>${rupiah(p.effective_price)}</td><td>${p.available_stock} <small>(fisik ${p.stock}, dipesan ${p.reserved_stock})</small></td><td><div class="inline-actions"><button onclick="startProductEdit(${p.id})">Edit</button><button onclick="startStockEdit(${p.id})">± Stok</button><button class="danger" onclick="deleteProduct(${p.id},${JSON.stringify(p.name)})">Hapus</button></div></td></tr>`}
+async async function loadProducts(page=pageState.products){pageState.products=Math.max(1,page);const d=await api('/api/admin/products?page='+pageState.products+'&page_size='+PAGE_SIZE);const rows=d.items||[];if(!rows.length&&pageState.products>1&&d.total>0){return loadProducts(pageState.products-1)}document.querySelector('#productsTable').innerHTML=rows.length?`<table><thead><tr><th>Produk</th><th>Harga</th><th>Diskon</th><th>Harga Jual</th><th>Stok</th><th>Aksi</th></tr></thead><tbody>${rows.map(productRow).join('')}</tbody></table>`:'<p>Belum ada produk.</p>';pager('productsPager',d.page,d.total,d.has_next,'loadProducts')}
 function startProductEdit(id){editingProductId=id;stockProductId=null;loadProducts(pageState.products)}function cancelProductEdit(){editingProductId=null;loadProducts(pageState.products)}
 async function saveProductEdit(id){const name=document.querySelector('#editName-'+id)?.value.trim();const price=Number(document.querySelector('#editPrice-'+id)?.value);const discount=Number(document.querySelector('#editDiscount-'+id)?.value);const stock=Number(document.querySelector('#editStock-'+id)?.value);if(!name||!Number.isInteger(price)||price<=0||!Number.isFinite(discount)||discount<0||discount>100||!Number.isInteger(stock)||stock<0)return alert('Data produk belum valid.');try{await api('/api/admin/products/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,price,discount_percent:discount,stock,is_active:true})});editingProductId=null;await loadProducts(pageState.products);await loadSummary()}catch(e){alert(e.message)}}
 function startStockEdit(id){stockProductId=id;editingProductId=null;loadProducts(pageState.products)}function cancelStockEdit(){stockProductId=null;loadProducts(pageState.products)}
 async function saveStock(id){const change=Number(document.querySelector('#stockChange-'+id)?.value);const reason=document.querySelector('#stockReason-'+id)?.value.trim();if(!Number.isInteger(change)||change===0)return alert('Perubahan stok harus bilangan bulat selain 0.');if(!reason)return alert('Alasan perubahan stok wajib diisi.');try{await api('/api/admin/products/'+id+'/stock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({change_qty:change,reason})});stockProductId=null;await loadProducts(pageState.products);await loadSummary()}catch(e){alert(e.message)}}
-async function deleteProduct(id){
-    if(!confirm('Hapus produk ini secara permanen?\n\nData produk akan benar-benar dihapus dari tabel products. Riwayat transaksi lama tetap disimpan.'))return;
-
-    try{
-        await api('/api/admin/products/'+id,{method:'DELETE'});
-        editingProductId=null;
-        stockProductId=null;
-        await loadProducts(pageState.products);
-        await loadSummary();
-        alert('Produk berhasil dihapus permanen dari database.');
-    }catch(e){
-        alert(e.message);
-    }
-}
+async function deleteProduct(id,name){if(!confirm(`Hapus permanen ${name}? Data produk akan benar-benar dihapus. Histori transaksi tetap menyimpan nama produk saat transaksi.`))return;try{await api('/api/admin/products/'+id,{method:'DELETE'});await loadProducts(pageState.products);await loadSummary()}catch(e){alert(e.message)}}
 document.querySelector('#productForm').addEventListener('submit',async e=>{e.preventDefault();const btn=e.target.querySelector('button');const payload={name:document.querySelector('#pName').value.trim(),price:Number(document.querySelector('#pPrice').value),discount_percent:Number(document.querySelector('#pDiscount').value),stock:Number(document.querySelector('#pStock').value)};if(!payload.name||!Number.isInteger(payload.price)||payload.price<=0||!Number.isFinite(payload.discount_percent)||payload.discount_percent<0||payload.discount_percent>100||!Number.isInteger(payload.stock)||payload.stock<0)return alert('Data produk belum valid.');btn.disabled=true;try{await api('/api/admin/products',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});e.target.reset();document.querySelector('#pDiscount').value=0;document.querySelector('#pStock').value=0;pageState.products=1;await loadProducts(1);await loadSummary()}catch(x){alert(x.message)}finally{btn.disabled=false}});
 async function loadTransactions(page=pageState.transactions){pageState.transactions=Math.max(1,page);const st=document.querySelector('#txFilter').value;const d=await api('/api/admin/transactions?status='+encodeURIComponent(st)+'&page='+pageState.transactions+'&page_size='+PAGE_SIZE);const rows=d.items||[];document.querySelector('#transactionsTable').innerHTML=rows.length?`<table><thead><tr><th>Order</th><th>Items</th><th>Total</th><th>Status</th><th>Waktu</th><th>Aksi</th></tr></thead><tbody>${rows.map(t=>`<tr><td><code>${esc(t.order_id)}</code></td><td>${t.items.map(i=>`${esc(i.product_name)} × ${i.quantity}`).join('<br>')}</td><td>${rupiah(t.total)}</td><td><span class="status-${t.payment_status}">${esc(t.payment_status)}</span></td><td>${new Date(t.created_at).toLocaleString('id-ID')}</td><td>${t.payment_status==='pending'?`<button onclick="verifyTx('${t.order_id}','success')">Bayar</button> <button class="danger" onclick="verifyTx('${t.order_id}','failed')">Tolak</button>`:'—'}</td></tr>`).join('')}</tbody></table>`:'<p>Belum ada transaksi.</p>';pager('transactionsPager',d.page,d.total,d.has_next,'loadTransactions')}
 async function verifyTx(id,status){if(!confirm(status==='success'?'Tandai pembayaran sebagai BERHASIL?':'Tolak pembayaran ini?'))return;try{await api('/api/admin/transactions/'+encodeURIComponent(id)+'/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})});await loadTransactions(pageState.transactions);await loadProducts(pageState.products);await loadSummary()}catch(e){alert(e.message)}}document.querySelector('#txFilter').onchange=()=>loadTransactions(1);
