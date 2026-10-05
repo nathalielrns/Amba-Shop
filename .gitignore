@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 smart_canteen.db
 .venv/
+
+node_modules/
+app/static/app.min.js

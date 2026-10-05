@@ -1,39 +1,29 @@
 const cart = new Map();
-
 const ACTIVE_ORDER_KEY = "smart_canteen_active_order";
 const SUPPORT_CACHE_KEY = "smart_canteen_support_cache";
 const SUPPORT_SEEN_KEY = "smart_canteen_support_seen_replies";
+const TRANSACTION_HISTORY_KEY = "smart_canteen_transaction_history";
 
 let products = [];
 let soldOutProducts = [];
-
 let supportMessages = [];
 let supportPollTimer = null;
-
 let showingSoldOut = false;
 let selectedSupportId = null;
 
+const rupiah = n => new Intl.NumberFormat("id-ID", {
+  style: "currency",
+  currency: "IDR",
+  maximumFractionDigits: 0
+}).format(n || 0);
 
-/* =========================================================
-   FORMAT
-========================================================= */
-
-const rupiah = n =>
-  new Intl.NumberFormat("id-ID", {
-    style: "currency",
-    currency: "IDR",
-    maximumFractionDigits: 0
-  }).format(n || 0);
-
-
-const esc = s =>
-  String(s ?? "").replace(/[&<>'"]/g, c => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    "'": "&#39;",
-    '"': "&quot;"
-  }[c]));
+const esc = s => String(s ?? "").replace(/[&<>'"]/g, c => ({
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  "'": "&#39;",
+  '"': "&quot;"
+}[c]));
 
 
 /* =========================================================
@@ -69,10 +59,62 @@ const icons = {
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="m9 18 6-6-6-6"/>
     </svg>
-  `
+  `,
 
+  bell: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9Z"/>
+      <path d="M10 21h4"/>
+    </svg>
+  `
 };
 
+
+/* =========================================================
+   CUSTOM UI DIALOGS
+========================================================= */
+
+function injectDialogUI(){
+  if(document.querySelector("#appDialog")) return;
+  document.body.insertAdjacentHTML("beforeend", `
+    <div id="appDialog" class="app-dialog" hidden>
+      <div class="app-dialog-backdrop"></div>
+      <section class="app-dialog-card" role="dialog" aria-modal="true" aria-labelledby="appDialogTitle">
+        <h3 id="appDialogTitle">Smart Canteen</h3><p id="appDialogMessage"></p>
+        <input id="appDialogInput" class="app-dialog-input" hidden autocomplete="off">
+        <div class="app-dialog-actions"><button id="appDialogCancel" type="button" class="app-dialog-secondary" hidden>Batal</button><button id="appDialogOk" type="button">OK</button></div>
+      </section>
+    </div>`);
+  document.querySelector("#appDialogOk").addEventListener("click",()=>finishDialog(true));
+  document.querySelector("#appDialogCancel").addEventListener("click",()=>finishDialog(false));
+  document.querySelector("#appDialog .app-dialog-backdrop").addEventListener("click",()=>finishDialog(false));
+}
+let dialogResolve=null;
+function finishDialog(value){const el=document.querySelector("#appDialog");if(!el||el.hidden)return;const input=document.querySelector("#appDialogInput");const result=input.hidden?value:(value?input.value:null);el.hidden=true;if(dialogResolve){const r=dialogResolve;dialogResolve=null;r(result);}}
+function uiAlert(message,title="Smart Canteen"){injectDialogUI();return new Promise(resolve=>{dialogResolve=()=>resolve();const el=document.querySelector("#appDialog"),input=document.querySelector("#appDialogInput");document.querySelector("#appDialogTitle").textContent=title;document.querySelector("#appDialogMessage").textContent=String(message??"");input.hidden=true;input.value="";document.querySelector("#appDialogCancel").hidden=true;document.querySelector("#appDialogOk").textContent="OK";el.hidden=false;});}
+function uiConfirm(message,title="Konfirmasi"){injectDialogUI();return new Promise(resolve=>{dialogResolve=value=>resolve(Boolean(value));const el=document.querySelector("#appDialog"),input=document.querySelector("#appDialogInput");document.querySelector("#appDialogTitle").textContent=title;document.querySelector("#appDialogMessage").textContent=String(message??"");input.hidden=true;input.value="";document.querySelector("#appDialogCancel").hidden=false;document.querySelector("#appDialogOk").textContent="Ya";el.hidden=false;});}
+function uiPrompt(message,defaultValue="",title="Isi data"){injectDialogUI();return new Promise(resolve=>{dialogResolve=value=>resolve(value);const el=document.querySelector("#appDialog"),input=document.querySelector("#appDialogInput");document.querySelector("#appDialogTitle").textContent=title;document.querySelector("#appDialogMessage").textContent=String(message??"");input.hidden=false;input.value=defaultValue??"";document.querySelector("#appDialogCancel").hidden=false;document.querySelector("#appDialogOk").textContent="Simpan";el.hidden=false;requestAnimationFrame(()=>{input.focus();input.select();});});}
+
+/* =========================================================
+   TRANSACTION NOTIFICATIONS / HISTORY
+========================================================= */
+function readTransactionHistory(){try{const rows=JSON.parse(localStorage.getItem(TRANSACTION_HISTORY_KEY)||"[]");return Array.isArray(rows)?rows:[];}catch{return[];}}
+function saveTransactionHistory(tx){if(!tx?.order_id)return;const rows=readTransactionHistory().filter(x=>x.order_id!==tx.order_id);rows.unshift({order_id:tx.order_id,total:tx.total,payment_status:tx.payment_status,payment_type:tx.payment_type||null,created_at:tx.created_at||new Date().toISOString(),updated_at:tx.updated_at||new Date().toISOString(),items:Array.isArray(tx.items)?tx.items:[]});localStorage.setItem(TRANSACTION_HISTORY_KEY,JSON.stringify(rows.slice(0,30)));renderTransactionHistory();updateTransactionBadge();}
+function transactionStatusLabel(status){return({success:"Berhasil",pending:"Menunggu pembayaran",cancelled:"Dibatalkan",expired:"Kedaluwarsa",failed:"Gagal"}[status]||status||"Tidak diketahui");}
+function transactionStatusClass(status){return`tx-${status||"unknown"}`;}
+function renderTransactionHistory(){const body=document.querySelector("#transactionPanelBody");if(!body)return;const rows=readTransactionHistory();if(!rows.length){body.innerHTML=`<div class="transaction-empty">Belum ada riwayat transaksi di perangkat ini.</div>`;return;}body.innerHTML=rows.map(tx=>`<button class="transaction-list-item" type="button" onclick="openTransactionDetail('${esc(tx.order_id)}')"><span class="transaction-list-icon">${icons.bell}</span><span class="transaction-list-copy"><span class="transaction-list-title">${esc(tx.items?.[0]?.product_name||"Transaksi")}${tx.items?.length>1?` + ${tx.items.length-1} lainnya`:""}</span><span class="transaction-list-meta">${rupiah(tx.total)} · ${transactionStatusLabel(tx.payment_status)} · ${tx.created_at?new Date(tx.created_at).toLocaleDateString("id-ID"):"-"}</span></span><span class="transaction-list-status ${transactionStatusClass(tx.payment_status)}">${esc(transactionStatusLabel(tx.payment_status))}</span></button>`).join("");}
+function updateTransactionBadge(){const badge=document.querySelector("#transactionFabBadge");if(!badge)return;const rows=readTransactionHistory();const hasPending=rows.some(x=>x.payment_status==="pending");badge.textContent=rows.length>99?"99+":rows.length;badge.hidden=!rows.length;badge.classList.toggle("pending",hasPending);}
+function openTransactionDetail(orderId){const tx=readTransactionHistory().find(x=>x.order_id===orderId);if(!tx)return;const body=document.querySelector("#transactionPanelBody");if(!body)return;body.innerHTML=`<div class="transaction-detail"><button class="transaction-detail-back" type="button" onclick="renderTransactionHistory()">${icons.back} Kembali</button><h3>${esc(tx.order_id)}</h3><p class="transaction-detail-date">${tx.created_at?new Date(tx.created_at).toLocaleString("id-ID"):"-"}</p><div class="transaction-detail-status ${transactionStatusClass(tx.payment_status)}">${esc(transactionStatusLabel(tx.payment_status))}</div><div class="transaction-detail-total"><span>Total</span><strong>${rupiah(tx.total)}</strong></div><div class="transaction-detail-items">${(tx.items||[]).map(i=>`<div><span>${esc(i.product_name)} × ${i.quantity}</span><strong>${rupiah(i.subtotal)}</strong></div>`).join("")||"Tidak ada detail item."}</div></div>`;}
+async function syncTransactionHistory(){
+  try{
+    const res=await fetch("/api/transactions/history?limit=30",{cache:"no-store"});
+    if(!res.ok)return;
+    const rows=await res.json();
+    if(!Array.isArray(rows)||!rows.length)return;
+    rows.slice().reverse().forEach(saveTransactionHistory);
+  }catch(e){console.debug("Riwayat server belum tersedia:",e);}
+}
+function setupTransactionUI(){if(document.querySelector("#transactionFab"))return;document.body.insertAdjacentHTML("beforeend",`<button id="transactionFab" class="transaction-fab" type="button" title="Riwayat transaksi" aria-label="Riwayat transaksi">${icons.bell}<span id="transactionFabBadge" class="transaction-fab-badge" hidden>0</span></button><aside id="transactionPanel" class="transaction-panel" hidden><div class="transaction-panel-head"><div><h3>Riwayat Transaksi</h3><small>Transaksi dari perangkat ini</small></div><button id="transactionPanelClose" class="transaction-panel-close" type="button">${icons.close}</button></div><div id="transactionPanelBody" class="transaction-panel-body"></div></aside>`);document.querySelector("#transactionFab").addEventListener("click",()=>{const panel=document.querySelector("#transactionPanel");panel.hidden=!panel.hidden;if(!panel.hidden)renderTransactionHistory();});document.querySelector("#transactionPanelClose").addEventListener("click",()=>document.querySelector("#transactionPanel").hidden=true);renderTransactionHistory();updateTransactionBadge();}
 
 /* =========================================================
    SUPPORT FLOATING UI
@@ -90,18 +132,15 @@ function injectSupportStyles() {
 
   style.textContent = `
 
+    .app-dialog[hidden],.transaction-panel[hidden]{display:none}.app-dialog{position:fixed;inset:0;z-index:3000;display:grid;place-items:center;padding:18px}.app-dialog-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.38);backdrop-filter:blur(2px)}.app-dialog-card{position:relative;width:min(420px,100%);background:#fff;border:1px solid #e2e4e8;border-radius:18px;padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.22)}.app-dialog-card h3{margin:0 0 8px}.app-dialog-card p{margin:0;white-space:pre-line;color:#4b5563;line-height:1.5}.app-dialog-input{width:100%;box-sizing:border-box;margin-top:14px;padding:11px 12px;border:1px solid #d5d8dd;border-radius:10px;font:inherit}.app-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.app-dialog-actions button{min-width:84px}.app-dialog-secondary{background:#f1f2f4!important;color:#20242b!important}
+    .transaction-fab{position:fixed;right:22px;bottom:92px;width:52px;height:52px;border:0;border-radius:50%;display:grid;place-items:center;background:#fff;color:#111318;box-shadow:0 10px 30px rgba(0,0,0,.18);cursor:pointer;z-index:1000;border:1px solid #e2e4e8}.transaction-fab svg{width:23px;height:23px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.transaction-fab-badge{position:absolute;right:-3px;top:-3px;min-width:19px;height:19px;padding:0 5px;border-radius:10px;background:#111318;color:#fff;font-size:10px;font-weight:700;display:grid;place-items:center;border:2px solid #fff}.transaction-fab-badge.pending{background:#b51d2b}.transaction-fab-badge[hidden]{display:none}.transaction-panel{position:fixed;right:22px;bottom:154px;width:min(430px,calc(100vw - 30px));max-height:min(620px,calc(100vh - 180px));background:#fff;border:1px solid #e2e4e8;border-radius:18px;box-shadow:0 18px 50px rgba(0,0,0,.18);z-index:999;overflow:hidden}.transaction-panel[hidden]{display:none}.transaction-panel-head{display:flex;align-items:center;justify-content:space-between;padding:15px 17px;border-bottom:1px solid #eceef1}.transaction-panel-head h3{margin:0;font-size:1rem}.transaction-panel-head small{display:block;margin-top:3px;color:#747982}.transaction-panel-close{width:34px;height:34px;border:0;border-radius:10px;background:#f1f2f4;display:grid;place-items:center}.transaction-panel-close svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}.transaction-panel-body{max-height:520px;overflow:auto;padding:8px}.transaction-list-item{width:100%;display:flex;align-items:center;gap:10px;padding:13px 10px;border:0;border-bottom:1px solid #f0f1f3;background:#fff;text-align:left;cursor:pointer}.transaction-list-item:hover{background:#f8f9fa}.transaction-list-icon{width:34px;height:34px;display:grid;place-items:center;border-radius:10px;background:#f1f2f4;flex:none}.transaction-list-icon svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8}.transaction-list-copy{min-width:0;display:flex;flex-direction:column;gap:3px;flex:1}.transaction-list-title{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.transaction-list-meta{font-size:.78rem;color:#747982}.transaction-list-status{font-size:.72rem;font-weight:700;white-space:nowrap}.tx-success{color:#2f8f4e}.tx-pending{color:#9a6a18}.tx-cancelled,.tx-failed{color:#777}.tx-expired{color:#9a6a18}.transaction-empty{text-align:center;color:#747982;padding:34px 18px}.transaction-detail{padding:8px}.transaction-detail-back{border:0;background:none;padding:6px 0;display:inline-flex;align-items:center;gap:4px}.transaction-detail-back svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.8}.transaction-detail h3{margin:15px 0 4px;font-size:.98rem;word-break:break-all}.transaction-detail-date{font-size:.78rem;color:#747982}.transaction-detail-status{margin:14px 0;padding:10px 12px;border-radius:10px;background:#f4f5f7}.transaction-detail-total{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #eceef1}.transaction-detail-items{padding-top:10px}.transaction-detail-items>div{display:flex;justify-content:space-between;gap:12px;padding:7px 0;font-size:.86rem}
+
     .sold-out-toggle{
-  margin:28px auto 32px;
-
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  gap:8px;
-
-  padding:12px 20px;
-
-  border-radius:14px;
-}
+      margin:18px auto 0;
+      display:flex;
+      align-items:center;
+      gap:8px;
+    }
 
     .sold-out-section[hidden]{
       display:none;
@@ -118,49 +157,6 @@ function injectSupportStyles() {
       filter:grayscale(.2);
     }
 
-    .delete-btn{
-  width:42px !important;
-  height:42px !important;
-
-  min-width:42px !important;
-  min-height:42px !important;
-
-  padding:0 !important;
-
-  display:inline-flex !important;
-  align-items:center !important;
-  justify-content:center !important;
-
-  flex:0 0 42px;
-
-  border:0 !important;
-  border-radius:12px !important;
-
-  background:#b51d2b !important;
-  color:#fff !important;
-
-  cursor:pointer;
-}
-
-.delete-btn:hover{
-  background:#961827 !important;
-}
-
-.delete-icon{
-  width:20px !important;
-  height:20px !important;
-
-  display:block !important;
-
-  flex:0 0 20px;
-
-  color:#fff !important;
-}
-
-.delete-icon path{
-  vector-effect:non-scaling-stroke;
-}
-
     .sold-out-card button{
       cursor:not-allowed;
     }
@@ -172,7 +168,6 @@ function injectSupportStyles() {
       position:fixed;
       right:22px;
       bottom:22px;
-
       width:58px;
       height:58px;
 
@@ -199,7 +194,6 @@ function injectSupportStyles() {
 
     .support-fab:hover{
       transform:translateY(-2px);
-
       box-shadow:
         0 14px 34px rgba(0,0,0,.24);
     }
@@ -593,6 +587,11 @@ function setupSupportUI(){
 
   injectSupportStyles();
 
+  /*
+    Kalau index.html lama masih punya
+    kotak "Pesan Saya", hapus otomatis
+    supaya tidak muncul dua UI.
+  */
   document
     .querySelector(".support-inbox")
     ?.remove();
@@ -767,6 +766,7 @@ async function checkActiveOrder(){
     localStorage.removeItem(
       ACTIVE_ORDER_KEY
     );
+    saveTransactionHistory(data);
 
 
   }catch(error){
@@ -785,7 +785,9 @@ async function checkActiveOrder(){
    PRODUCTS
 ========================================================= */
 
-async function loadProducts(includeUnavailable = false){
+async function loadProducts(
+  includeUnavailable = false
+){
 
   const url =
     includeUnavailable
@@ -815,82 +817,21 @@ async function loadProducts(includeUnavailable = false){
     await res.json();
 
 
-  /*
-    Mode normal:
-    - products = produk yang tersedia
-    - ambil juga produk habis
-      supaya tombolnya langsung muncul
-  */
-
-  if (!includeUnavailable){
+  if (includeUnavailable){
 
     products =
       data.filter(
         p => p.available_stock > 0
       );
-
-
-    try{
-
-      const soldOutRes =
-        await fetch(
-          "/api/products?include_unavailable=true",
-          {
-            cache:"no-store"
-          }
-        );
-
-
-      if (soldOutRes.ok){
-
-        const soldOutData =
-          await soldOutRes.json();
-
-
-        soldOutProducts =
-          soldOutData.filter(
-            p => p.available_stock <= 0
-          );
-
-      }else{
-
-        soldOutProducts = [];
-
-      }
-
-
-    }catch(error){
-
-      console.error(
-        "Gagal mengambil produk habis:",
-        error
-      );
-
-      soldOutProducts = [];
-
-    }
-
-  }
-
-
-  /*
-    Mode produk habis:
-    backend mengirim produk yang
-    tidak tersedia.
-  */
-
-  else{
-
-    products =
-      data.filter(
-        p => p.available_stock > 0
-      );
-
 
     soldOutProducts =
       data.filter(
         p => p.available_stock <= 0
       );
+
+  }else{
+
+    products = data;
 
   }
 
@@ -899,10 +840,6 @@ async function loadProducts(includeUnavailable = false){
 
 }
 
-
-/* =========================================================
-   PRODUCT CARD
-========================================================= */
 
 function productCard(
   p,
@@ -984,10 +921,6 @@ function productCard(
 }
 
 
-/* =========================================================
-   RENDER PRODUCTS
-========================================================= */
-
 function renderProducts(){
 
   const box =
@@ -998,10 +931,6 @@ function renderProducts(){
 
   if (!box) return;
 
-
-  /*
-    Produk tersedia
-  */
 
   const availableHtml =
     products.length
@@ -1026,16 +955,12 @@ function renderProducts(){
       `;
 
 
-box.innerHTML =
-  availableHtml;
+  box.innerHTML =
+    availableHtml;
 
-box.classList.remove("products-loading");
-box.removeAttribute("aria-busy");
+  box.classList.remove("products-loading");
+  box.removeAttribute("aria-busy");
 
-
-  /*
-    Container produk habis
-  */
 
   let soldOutSection =
     document.querySelector(
@@ -1050,14 +975,11 @@ box.removeAttribute("aria-busy");
         "section"
       );
 
-
     soldOutSection.id =
       "soldOutSection";
 
-
     soldOutSection.className =
       "sold-out-section";
-
 
     box.insertAdjacentElement(
       "afterend",
@@ -1067,20 +989,13 @@ box.removeAttribute("aria-busy");
   }
 
 
-  /*
-    Kalau tidak ada produk habis,
-    tombol tidak perlu ditampilkan.
-  */
-
   if (
-    !soldOutProducts.length
+    !soldOutProducts.length &&
+    !showingSoldOut
   ){
 
     soldOutSection.hidden =
       true;
-
-    soldOutSection.innerHTML =
-      "";
 
     return;
 
@@ -1109,6 +1024,7 @@ box.removeAttribute("aria-busy");
           :
 
           `Lihat produk habis (${soldOutProducts.length})`
+
       }
 
     </button>
@@ -1155,45 +1071,35 @@ box.removeAttribute("aria-busy");
   `;
 
 
-  const toggle =
-    document.querySelector(
+  document
+    .querySelector(
       "#soldOutToggle"
-    );
+    )
+    .addEventListener(
+      "click",
+      async () => {
+
+        showingSoldOut =
+          !showingSoldOut;
 
 
-  if (!toggle) return;
+        if (
+          showingSoldOut &&
+          !soldOutProducts.length
+        ){
 
+          await loadProducts(
+            true
+          );
 
-  toggle.addEventListener(
-    "click",
-    async () => {
+        }else{
 
-      showingSoldOut =
-        !showingSoldOut;
+          renderProducts();
 
-
-      /*
-        Kalau data produk habis
-        belum ada, ambil ulang.
-      */
-
-      if (
-        showingSoldOut &&
-        !soldOutProducts.length
-      ){
-
-        await loadProducts(
-          true
-        );
-
-      }else{
-
-        renderProducts();
+        }
 
       }
-
-    }
-  );
+    );
 
 }
 
@@ -1209,7 +1115,6 @@ function addToCart(id){
       x => x.id === id
     );
 
-
   if (!p) return;
 
 
@@ -1222,9 +1127,7 @@ function addToCart(id){
     p.available_stock
   ){
 
-    return alert(
-      `Stok ${p.name} hanya ${p.available_stock}.`
-    );
+    return uiAlert(`Stok ${p.name} hanya ${p.available_stock}.`);
 
   }
 
@@ -1245,9 +1148,7 @@ function addToCart(id){
 
 
 function increaseCart(id){
-
   addToCart(id);
-
 }
 
 
@@ -1255,7 +1156,6 @@ function decreaseCart(id){
 
   const item =
     cart.get(id);
-
 
   if (!item) return;
 
@@ -1297,7 +1197,6 @@ function renderCart(){
     document.querySelector(
       "#cart"
     );
-
 
   if (!cartEl) return;
 
@@ -1351,64 +1250,23 @@ function renderCart(){
 
 
                 <button
-  class="delete-btn"
-  type="button"
-  title="Hapus dari keranjang"
-  aria-label="Hapus ${esc(p.name)} dari keranjang"
-  onclick="removeFromCart(${p.id})"
->
-  <svg
-    class="delete-icon"
-    viewBox="0 0 24 24"
-    aria-hidden="true"
-  >
-    <path
-      d="M4 7h16"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="2"
-      stroke-linecap="round"
-    />
-
-    <path
-      d="M9 7V4h6v3"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="2"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-    />
-
-    <path
-      d="M6 7l1 13h10l1-13"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="2"
-      stroke-linejoin="round"
-    />
-
-    <path
-      d="M10 11v5M14 11v5"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="2"
-      stroke-linecap="round"
-    />
-  </svg>
-</button>
+                  class="delete-btn"
+                  title="Hapus dari keranjang"
+                  onclick="removeFromCart(${p.id})"
+                >
+                  ${icons.close}
+                </button>
 
               </div>
 
 
               <strong>
-
                 ${
                   rupiah(
                     p.effective_price *
                     p.quantity
                   )
                 }
-
               </strong>
 
             </div>
@@ -1481,9 +1339,7 @@ async function checkout(){
 
   if (!items.length){
 
-    return alert(
-      "Keranjang masih kosong."
-    );
+    return uiAlert("Keranjang masih kosong.");
 
   }
 
@@ -1494,14 +1350,10 @@ async function checkout(){
     );
 
 
-  if (btn){
+  btn.disabled = true;
 
-    btn.disabled = true;
-
-    btn.textContent =
-      "Membuat transaksi...";
-
-  }
+  btn.textContent =
+    "Membuat transaksi...";
 
 
   try{
@@ -1552,20 +1404,12 @@ async function checkout(){
 
   }catch(e){
 
-    alert(
-      e.message
-    );
+    uiAlert(e.message);
 
+    btn.disabled = false;
 
-    if (btn){
-
-      btn.disabled = false;
-
-      btn.textContent =
-        "Checkout & Generate QRIS";
-
-    }
-
+    btn.textContent =
+      "Checkout & Generate QRIS";
 
     await loadProducts();
 
@@ -1741,8 +1585,8 @@ function supportTitle(
     String(
       message || ""
     )
-      .split(/\r?\n/)[0]
-      .trim();
+    .split(/\r?\n/)[0]
+    .trim();
 
 
   return title.length > 48
@@ -1804,13 +1648,11 @@ function renderSupportList(){
               <span
                 class="support-list-title"
               >
-
                 ${esc(
                   supportTitle(
                     m.message
                   )
                 )}
-
               </span>
 
 
@@ -1892,9 +1734,6 @@ function openSupportDetail(
     document.querySelector(
       "#supportPanelBody"
     );
-
-
-  if (!body) return;
 
 
   const tx =
@@ -2077,8 +1916,7 @@ function openSupportDetail(
 
                   <strong>
                     ${esc(
-                      tx.payment_status ||
-                      "-"
+                      tx.payment_status
                     )}
                   </strong>
 
@@ -2136,7 +1974,6 @@ function openSupportDetail(
                             >
 
                               <span>
-
                                 ${
                                   esc(
                                     i.product_name
@@ -2144,20 +1981,16 @@ function openSupportDetail(
                                 }
 
                                 ×
-
                                 ${i.quantity}
-
                               </span>
 
 
                               <strong>
-
                                 ${
                                   rupiah(
                                     i.subtotal
                                   )
                                 }
-
                               </strong>
 
                             </div>
@@ -2238,9 +2071,7 @@ async function loadSupportMessages(
 
     if (showError){
 
-      alert(
-        e.message
-      );
+      uiAlert(e.message,"Gagal");
 
     }
 
@@ -2255,39 +2086,31 @@ async function loadSupportMessages(
 
 async function sendSupport(){
 
-  const messageEl =
-    document.querySelector(
-      "#supportMessage"
-    );
-
-  const contactEl =
-    document.querySelector(
-      "#supportContact"
-    );
-
-  const orderEl =
-    document.querySelector(
-      "#supportOrderId"
-    );
-
-
-  if (!messageEl) return;
-
-
   const message =
-    messageEl.value.trim();
+    document
+      .querySelector(
+        "#supportMessage"
+      )
+      .value
+      .trim();
 
 
   const contact =
-    contactEl
-      ? contactEl.value.trim()
-      : "";
+    document
+      .querySelector(
+        "#supportContact"
+      )
+      .value
+      .trim();
 
 
   const orderId =
-    orderEl
-      ? orderEl.value.trim()
-      : "";
+    document
+      .querySelector(
+        "#supportOrderId"
+      )
+      .value
+      .trim();
 
 
   const btn =
@@ -2298,18 +2121,12 @@ async function sendSupport(){
 
   if (!message){
 
-    return alert(
-      "Tulis pesan dulu."
-    );
+    return uiAlert("Tulis pesan dulu.");
 
   }
 
 
-  if (btn){
-
-    btn.disabled = true;
-
-  }
+  btn.disabled = true;
 
 
   try{
@@ -2328,11 +2145,9 @@ async function sendSupport(){
           body:
             JSON.stringify({
               message,
-
               contact:
                 contact ||
                 null,
-
               order_id:
                 orderId ||
                 null
@@ -2356,12 +2171,14 @@ async function sendSupport(){
     }
 
 
-    alert(
-      data.message
-    );
+    uiAlert(data.message,"Pesan terkirim");
 
 
-    messageEl.value = "";
+    document
+      .querySelector(
+        "#supportMessage"
+      )
+      .value = "";
 
 
     await loadSupportMessages();
@@ -2369,18 +2186,12 @@ async function sendSupport(){
 
   }catch(e){
 
-    alert(
-      e.message
-    );
+    uiAlert(e.message,"Gagal");
 
 
   }finally{
 
-    if (btn){
-
-      btn.disabled = false;
-
-    }
+    btn.disabled = false;
 
   }
 
@@ -2395,7 +2206,6 @@ const checkoutBtn =
   document.querySelector(
     "#checkoutBtn"
   );
-
 
 if (checkoutBtn){
 
@@ -2412,7 +2222,6 @@ const sendSupportBtn =
     "#sendSupportBtn"
   );
 
-
 if (sendSupportBtn){
 
   sendSupportBtn.addEventListener(
@@ -2423,6 +2232,9 @@ if (sendSupportBtn){
 }
 
 
+injectDialogUI();
+setupTransactionUI();
+syncTransactionHistory();
 setupSupportUI();
 
 readSupportCache();
@@ -2458,7 +2270,6 @@ loadProducts(true)
 
 
 loadSupportMessages();
-
 
 checkActiveOrder();
 
